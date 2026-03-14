@@ -71,13 +71,22 @@ jobs:
         id: image-name
         run: echo "value=ghcr.io/${{ github.repository }}" >> "$GITHUB_OUTPUT"
 
+      - name: Set Docker Hub image name
+        id: dockerhub-image
+        run: |
+          if [ "${{ github.repository }}" = "dexidp/dex" ]; then
+            echo "value=dexidp/dex" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ secrets.DOCKER_USERNAME }}/dex" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Gather build metadata
         id: meta
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
         with:
           images: |
             ${{ steps.image-name.outputs.value }}
-            ${{ github.repository == 'dexidp/dex' && 'dexidp/dex' || '' }}
+            ${{ steps.dockerhub-image.outputs.value }}
           flavor: |
             latest = false
           tags: |
