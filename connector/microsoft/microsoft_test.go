@@ -218,6 +218,197 @@ expectEquals(t, identity, connector.Identity{})
 }
 }
 
+// TestIsAllowedDomain directly exercises the isAllowedDomain helper with all
+// relevant edge-cases so that bugs in the pure logic can be caught without
+// needing a mock HTTP server.
+func TestIsAllowedDomain(t *testing.T) {
+	tests := []struct {
+		name           string
+		allowedDomains []string
+		email          string
+		want           bool
+	}{
+		{
+			name:           "empty allowed list permits every domain",
+			allowedDomains: []string{},
+			email:          "user@any-domain.io",
+			want:           true,
+		},
+		{
+			name:           "nil allowed list permits every domain",
+			allowedDomains: nil,
+			email:          "user@any-domain.io",
+			want:           true,
+		},
+		{
+			name:           "email domain matches single allowed domain",
+			allowedDomains: []string{"example.com"},
+			email:          "user@example.com",
+			want:           true,
+		},
+		{
+			name:           "email domain matches one of several allowed domains",
+			allowedDomains: []string{"foo.com", "example.com", "bar.org"},
+			email:          "user@example.com",
+			want:           true,
+		},
+		{
+			name:           "email domain not in allowed list",
+			allowedDomains: []string{"example.com"},
+			email:          "user@other.com",
+			want:           false,
+		},
+		{
+			name:           "email without @ sign is rejected",
+			allowedDomains: []string{"example.com"},
+			email:          "invalid-email",
+			want:           false,
+		},
+		{
+			name:           "email with multiple @ signs is rejected",
+			allowedDomains: []string{"example.com"},
+			email:          "user@host@example.com",
+			want:           false,
+		},
+		{
+			name:           "domain match is case-sensitive",
+			allowedDomains: []string{"Example.com"},
+			email:          "user@example.com",
+			want:           false,
+		},
+		{
+			name:           "exact case match succeeds",
+			allowedDomains: []string{"Example.com"},
+			email:          "user@Example.com",
+			want:           true,
+		},
+		{
+			name:           "empty email string is rejected",
+			allowedDomains: []string{"example.com"},
+			email:          "",
+			want:           false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := microsoftConnector{allowedDomains: tc.allowedDomains}
+			got := c.isAllowedDomain(tc.email)
+			if got != tc.want {
+				t.Errorf("isAllowedDomain(%q) with allowedDomains=%v = %v, want %v",
+					tc.email, tc.allowedDomains, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAllowedDomainsEmptyAllowsAll is an integration-level test confirming that
+// when no allowedDomains are configured the connector accepts users from any
+// domain — i.e. the feature is opt-in and does not break existing behaviour.
+func TestAllowedDomainsEmptyAllowsAll(t *testing.T) {
+	emails := []string{
+		"alice@example.com",
+		"bob@dcode.tech",
+		"carol@completely-different.org",
+	}
+
+	for _, email := range emails {
+		s := newTestServer(map[string]testResponse{
+			"/v1.0/me?$select=id,displayName,userPrincipalName": {
+				data: user{ID: "id-001", Name: "Test User", Email: email},
+			},
+			"/" + tenant + "/oauth2/v2.0/token": dummyToken,
+		})
+		defer s.Close()
+
+		req, _ := http.NewRequest("GET", s.URL, nil)
+		c := microsoftConnector{
+			apiURL:   s.URL,
+			graphURL: s.URL,
+			tenant:   tenant,
+			// intentionally no allowedDomains — all domains must be accepted
+		}
+
+		identity, err := c.HandleCallback(connector.Scopes{Groups: false}, nil, req)
+		if err != nil {
+			t.Errorf("email %q: expected no error with empty allowedDomains, got: %v", email, err)
+		}
+		if identity.Email != email {
+			t.Errorf("email %q: expected identity.Email to be %q, got %q", email, email, identity.Email)
+		}
+	}
+}
+
+// TestEmailToLowercaseWithAllowedDomains verifies that when emailToLowercase is
+// enabled the domain comparison still works correctly because the email is
+// lowercased before the domain check is performed.
+func TestEmailToLowercaseWithAllowedDomains(t *testing.T) {
+	tests := []struct {
+		name           string
+		rawEmail       string   // email returned by the Graph API (potentially mixed-case)
+		allowedDomains []string // domains configured in the connector
+		wantErr        bool
+		wantEmail      string // expected value of identity.Email after lowercasing
+	}{
+		{
+			name:           "mixed-case email lowercased before domain check",
+			rawEmail:       "User@Example.COM",
+			allowedDomains: []string{"example.com"},
+			wantErr:        false,
+			wantEmail:      "user@example.com",
+		},
+		{
+			name:           "already lowercase email passes domain check",
+			rawEmail:       "user@example.com",
+			allowedDomains: []string{"example.com"},
+			wantErr:        false,
+			wantEmail:      "user@example.com",
+		},
+		{
+			name:           "lowercased domain not in allowed list is rejected",
+			rawEmail:       "User@Other.COM",
+			allowedDomains: []string{"example.com"},
+			wantErr:        true,
+			wantEmail:      "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer(map[string]testResponse{
+				"/v1.0/me?$select=id,displayName,userPrincipalName": {
+					data: user{ID: "id-001", Name: "Test User", Email: tc.rawEmail},
+				},
+				"/" + tenant + "/oauth2/v2.0/token": dummyToken,
+			})
+			defer s.Close()
+
+			req, _ := http.NewRequest("GET", s.URL, nil)
+			c := microsoftConnector{
+				apiURL:           s.URL,
+				graphURL:         s.URL,
+				tenant:           tenant,
+				allowedDomains:   tc.allowedDomains,
+				emailToLowercase: true,
+			}
+
+			identity, err := c.HandleCallback(connector.Scopes{Groups: false}, nil, req)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error but got identity %+v", identity)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if identity.Email != tc.wantEmail {
+				t.Errorf("identity.Email = %q, want %q", identity.Email, tc.wantEmail)
+			}
+		})
+	}
+}
+
 func newTestServer(responses map[string]testResponse) *httptest.Server {
 s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 response, found := responses[r.RequestURI]
