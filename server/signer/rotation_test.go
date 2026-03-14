@@ -1,20 +1,18 @@
-package server
+package signer
 
 import (
-	"os"
+	"context"
+	"log/slog"
 	"sort"
 	"testing"
 	"time"
-
-	"github.com/sirupsen/logrus"
-	"github.com/stretchr/testify/require"
 
 	"github.com/dexidp/dex/storage"
 	"github.com/dexidp/dex/storage/memory"
 )
 
 func signingKeyID(t *testing.T, s storage.Storage) string {
-	keys, err := s.GetKeys()
+	keys, err := s.GetKeys(context.TODO())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,7 +20,7 @@ func signingKeyID(t *testing.T, s storage.Storage) string {
 }
 
 func verificationKeyIDs(t *testing.T, s storage.Storage) (ids []string) {
-	keys, err := s.GetKeys()
+	keys, err := s.GetKeys(context.TODO())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,11 +66,7 @@ func TestKeyRotator(t *testing.T) {
 	// Only the last 5 verification keys are expected to be kept around.
 	maxVerificationKeys := 5
 
-	l := &logrus.Logger{
-		Out:       os.Stderr,
-		Formatter: &logrus.TextFormatter{DisableColors: true},
-		Level:     logrus.DebugLevel,
-	}
+	l := slog.New(slog.DiscardHandler)
 
 	r := &keyRotator{
 		Storage:  memory.New(l),
@@ -100,30 +94,4 @@ func TestKeyRotator(t *testing.T) {
 			expVerificationKeys = expVerificationKeys[n-maxVerificationKeys:]
 		}
 	}
-}
-
-func TestRefreshTokenPolicy(t *testing.T) {
-	lastTime := time.Now()
-	l := &logrus.Logger{
-		Out:       os.Stderr,
-		Formatter: &logrus.TextFormatter{DisableColors: true},
-		Level:     logrus.DebugLevel,
-	}
-
-	r, err := NewRefreshTokenPolicy(l, true, "1m", "1m", "1m")
-	require.NoError(t, err)
-
-	t.Run("Allowed", func(t *testing.T) {
-		r.now = func() time.Time { return lastTime }
-		require.Equal(t, true, r.AllowedToReuse(lastTime))
-		require.Equal(t, false, r.ExpiredBecauseUnused(lastTime))
-		require.Equal(t, false, r.CompletelyExpired(lastTime))
-	})
-
-	t.Run("Expired", func(t *testing.T) {
-		r.now = func() time.Time { return lastTime.Add(2 * time.Minute) }
-		require.Equal(t, false, r.AllowedToReuse(lastTime))
-		require.Equal(t, true, r.ExpiredBecauseUnused(lastTime))
-		require.Equal(t, true, r.CompletelyExpired(lastTime))
-	})
 }

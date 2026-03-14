@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -18,7 +19,6 @@ import (
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/dexidp/dex/connector"
@@ -63,7 +63,11 @@ func TestHandleCallback(t *testing.T) {
 		expectPreferredUsername   string
 		expectedEmailField        string
 		token                     map[string]interface{}
+		groupsRegex               string
 		newGroupFromClaims        []NewGroupFromClaims
+		groupsPrefix              string
+		groupsSuffix              string
+		pkceChallenge             string
 	}{
 		{
 			name:               "simpleCase",
@@ -291,6 +295,38 @@ func TestHandleCallback(t *testing.T) {
 			},
 		},
 		{
+			name:               "singularGroupResponseAsMap",
+			userIDKey:          "", // not configured
+			userNameKey:        "", // not configured
+			expectUserID:       "subvalue",
+			expectUserName:     "namevalue",
+			expectGroups:       []string{"group1"},
+			expectedEmailField: "emailvalue",
+			token: map[string]interface{}{
+				"sub":            "subvalue",
+				"name":           "namevalue",
+				"groups":         []map[string]string{{"name": "group1"}},
+				"email":          "emailvalue",
+				"email_verified": true,
+			},
+		},
+		{
+			name:               "multipleGroupResponseAsMap",
+			userIDKey:          "", // not configured
+			userNameKey:        "", // not configured
+			expectUserID:       "subvalue",
+			expectUserName:     "namevalue",
+			expectGroups:       []string{"group1", "group2"},
+			expectedEmailField: "emailvalue",
+			token: map[string]interface{}{
+				"sub":            "subvalue",
+				"name":           "namevalue",
+				"groups":         []map[string]string{{"name": "group1"}, {"name": "group2"}},
+				"email":          "emailvalue",
+				"email_verified": true,
+			},
+		},
+		{
 			name:               "newGroupFromClaims",
 			userIDKey:          "", // not configured
 			userNameKey:        "", // not configured
@@ -363,6 +399,126 @@ func TestHandleCallback(t *testing.T) {
 				"non-string-claim2": 666,
 			},
 		},
+		{
+			name:               "prefixGroupNames",
+			userIDKey:          "", // not configured
+			userNameKey:        "", // not configured
+			expectUserID:       "subvalue",
+			expectUserName:     "namevalue",
+			expectGroups:       []string{"prefix-group1", "prefix-group2", "prefix-groupA", "prefix-groupB"},
+			expectedEmailField: "emailvalue",
+			groupsPrefix:       "prefix-",
+			token: map[string]interface{}{
+				"sub":            "subvalue",
+				"name":           "namevalue",
+				"groups":         []string{"group1", "group2", "groupA", "groupB"},
+				"email":          "emailvalue",
+				"email_verified": true,
+			},
+		},
+		{
+			name:               "suffixGroupNames",
+			userIDKey:          "", // not configured
+			userNameKey:        "", // not configured
+			expectUserID:       "subvalue",
+			expectUserName:     "namevalue",
+			expectGroups:       []string{"group1-suffix", "group2-suffix", "groupA-suffix", "groupB-suffix"},
+			expectedEmailField: "emailvalue",
+			groupsSuffix:       "-suffix",
+			token: map[string]interface{}{
+				"sub":            "subvalue",
+				"name":           "namevalue",
+				"groups":         []string{"group1", "group2", "groupA", "groupB"},
+				"email":          "emailvalue",
+				"email_verified": true,
+			},
+		},
+		{
+			name:               "preAndSuffixGroupNames",
+			userIDKey:          "", // not configured
+			userNameKey:        "", // not configured
+			expectUserID:       "subvalue",
+			expectUserName:     "namevalue",
+			expectGroups:       []string{"prefix-group1-suffix", "prefix-group2-suffix", "prefix-groupA-suffix", "prefix-groupB-suffix"},
+			expectedEmailField: "emailvalue",
+			groupsPrefix:       "prefix-",
+			groupsSuffix:       "-suffix",
+			token: map[string]interface{}{
+				"sub":            "subvalue",
+				"name":           "namevalue",
+				"groups":         []string{"group1", "group2", "groupA", "groupB"},
+				"email":          "emailvalue",
+				"email_verified": true,
+			},
+		},
+		{
+			name:               "filterGroupClaims",
+			userIDKey:          "", // not configured
+			userNameKey:        "", // not configured
+			groupsRegex:        `^.*\d$`,
+			expectUserID:       "subvalue",
+			expectUserName:     "namevalue",
+			expectGroups:       []string{"group1", "group2"},
+			expectedEmailField: "emailvalue",
+			token: map[string]interface{}{
+				"sub":            "subvalue",
+				"name":           "namevalue",
+				"groups":         []string{"group1", "group2", "groupA", "groupB"},
+				"email":          "emailvalue",
+				"email_verified": true,
+			},
+		},
+		{
+			name:               "filterGroupClaimsMap",
+			userIDKey:          "", // not configured
+			userNameKey:        "", // not configured
+			groupsRegex:        `^.*\d$`,
+			expectUserID:       "subvalue",
+			expectUserName:     "namevalue",
+			expectGroups:       []string{"group1", "group2"},
+			expectedEmailField: "emailvalue",
+			token: map[string]interface{}{
+				"sub":            "subvalue",
+				"name":           "namevalue",
+				"groups":         []map[string]string{{"name": "group1"}, {"name": "group2"}, {"name": "groupA"}, {"name": "groupB"}},
+				"email":          "emailvalue",
+				"email_verified": true,
+			},
+		},
+		{
+			name:               "S256PKCEChallenge",
+			userIDKey:          "", // not configured
+			userNameKey:        "", // not configured
+			pkceChallenge:      "S256",
+			expectUserID:       "subvalue",
+			expectUserName:     "namevalue",
+			expectGroups:       []string{"group1", "group2"},
+			expectedEmailField: "emailvalue",
+			token: map[string]interface{}{
+				"sub":            "subvalue",
+				"name":           "namevalue",
+				"groups":         []string{"group1", "group2"},
+				"email":          "emailvalue",
+				"email_verified": true,
+			},
+		},
+		{
+			name:               "plainPKCEChallenge",
+			userIDKey:          "", // not configured
+			userNameKey:        "", // not configured
+			pkceChallenge:      "plain",
+			expectUserID:       "subvalue",
+			expectUserName:     "namevalue",
+			expectGroups:       []string{"group1", "group2"},
+			expectedEmailField: "emailvalue",
+			token: map[string]interface{}{
+				"sub":            "subvalue",
+				"name":           "namevalue",
+				"groups":         []string{"group1", "group2"},
+				"email":          "emailvalue",
+				"email_verified": true,
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -394,11 +550,15 @@ func TestHandleCallback(t *testing.T) {
 				InsecureEnableGroups:      true,
 				BasicAuthUnsupported:      &basicAuth,
 				OverrideClaimMapping:      tc.overrideClaimMapping,
+				PKCEChallenge:             tc.pkceChallenge,
 			}
 			config.ClaimMapping.PreferredUsernameKey = tc.preferredUsernameKey
 			config.ClaimMapping.EmailKey = tc.emailKey
 			config.ClaimMapping.GroupsKey = tc.groupsKey
 			config.ClaimMutations.NewGroupFromClaims = tc.newGroupFromClaims
+			config.ClaimMutations.FilterGroupClaims.GroupsFilter = tc.groupsRegex
+			config.ClaimMutations.ModifyGroupNames.Prefix = tc.groupsPrefix
+			config.ClaimMutations.ModifyGroupNames.Suffix = tc.groupsSuffix
 
 			conn, err := newConnector(config)
 			if err != nil {
@@ -410,7 +570,11 @@ func TestHandleCallback(t *testing.T) {
 				t.Fatal("failed to create request", err)
 			}
 
-			identity, err := conn.HandleCallback(connector.Scopes{Groups: true}, req)
+			connectorDataStrTemplate := `{"codeChallenge":"abcdefgh123456qwertuiop89101112uvpwizABC234","codeChallengeMethod":"%s"}`
+			connectorDataStr := fmt.Sprintf(connectorDataStrTemplate, config.PKCEChallenge)
+			connectorData := []byte(connectorDataStr)
+
+			identity, err := conn.HandleCallback(connector.Scopes{Groups: true}, connectorData, req)
 			if err != nil {
 				t.Fatal("handle callback failed", err)
 			}
@@ -765,7 +929,7 @@ func newToken(key *jose.JSONWebKey, claims map[string]interface{}) (string, erro
 }
 
 func newConnector(config Config) (*oidcConnector, error) {
-	logger := logrus.New()
+	logger := slog.New(slog.DiscardHandler)
 	conn, err := config.Open("id", logger)
 	if err != nil {
 		return nil, fmt.Errorf("unable to open: %v", err)

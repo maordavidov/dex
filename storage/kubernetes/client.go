@@ -13,6 +13,7 @@ import (
 	"hash"
 	"hash/fnv"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -27,16 +28,26 @@ import (
 	"github.com/ghodss/yaml"
 	"golang.org/x/net/http2"
 
-	"github.com/dexidp/dex/pkg/log"
 	"github.com/dexidp/dex/storage"
 	"github.com/dexidp/dex/storage/kubernetes/k8sapi"
+)
+
+const (
+	serviceAccountPath          = "/var/run/secrets/kubernetes.io/serviceaccount/"
+	serviceAccountTokenPath     = serviceAccountPath + "token"
+	serviceAccountCAPath        = serviceAccountPath + "ca.crt"
+	serviceAccountNamespacePath = serviceAccountPath + "namespace"
+
+	kubernetesServiceHostENV  = "KUBERNETES_SERVICE_HOST"
+	kubernetesServicePortENV  = "KUBERNETES_SERVICE_PORT"
+	kubernetesPodNamespaceENV = "KUBERNETES_POD_NAMESPACE"
 )
 
 type client struct {
 	client    *http.Client
 	baseURL   string
 	namespace string
-	logger    log.Logger
+	logger    *slog.Logger
 
 	// Hash function to map IDs (which could span a large range) to Kubernetes names.
 	// While this is not currently upgradable, it could be in the future.
@@ -53,6 +64,11 @@ type client struct {
 	// Different Kubernetes version requires to create CRD in certain API. It will be discovered automatically on
 	// storage opening.
 	crdAPIVersion string
+
+	// CRD handling behavior controls how missing Custom Resource Definitions are handled:
+	// - "ensure": Attempt to create all missing CRDs. Fails if any CRD creation fails. (default)
+	// - "check": Fail if any CRDs are missing, with error "storage is not initialized, CRDs are not created"
+	crdHandling string
 
 	// This is called once the client's Close method is called to signal goroutines,
 	// such as the one creating third party resources, to stop.
@@ -268,7 +284,7 @@ func (cli *client) detectKubernetesVersion() error {
 
 	clusterVersion, err := semver.NewVersion(version.GitVersion)
 	if err != nil {
-		cli.logger.Warnf("cannot detect Kubernetes version (%s): %v", clusterVersion, err)
+		cli.logger.Warn("cannot detect Kubernetes version", "version", clusterVersion, "err", err)
 		return nil
 	}
 
@@ -358,7 +374,7 @@ func defaultTLSConfig() *tls.Config {
 	}
 }
 
-func newClient(cluster k8sapi.Cluster, user k8sapi.AuthInfo, namespace string, logger log.Logger, inCluster bool) (*client, error) {
+func newClient(cluster k8sapi.Cluster, user k8sapi.AuthInfo, namespace string, logger *slog.Logger, inCluster bool, crdHandling string) (*client, error) {
 	tlsConfig := defaultTLSConfig()
 	data := func(b string, file string) ([]byte, error) {
 		if b != "" {
@@ -418,7 +434,7 @@ func newClient(cluster k8sapi.Cluster, user k8sapi.AuthInfo, namespace string, l
 
 	apiVersion := "dex.coreos.com/v1"
 
-	logger.Infof("kubernetes client apiVersion = %s", apiVersion)
+	logger.Info("kubernetes client", "api_version", apiVersion)
 	return &client{
 		client: &http.Client{
 			Transport: t,
@@ -429,6 +445,7 @@ func newClient(cluster k8sapi.Cluster, user k8sapi.AuthInfo, namespace string, l
 		namespace:     namespace,
 		apiVersion:    apiVersion,
 		crdAPIVersion: crdAPIVersion,
+		crdHandling:   crdHandling,
 		logger:        logger,
 	}, nil
 }
@@ -508,32 +525,26 @@ func getInClusterConfigNamespace(token, namespaceENV, namespacePath string) (str
 	return "", fmt.Errorf("%v: trying to get namespace from file: %v", err, fileErr)
 }
 
-func inClusterConfig() (k8sapi.Cluster, k8sapi.AuthInfo, string, error) {
-	const (
-		serviceAccountPath          = "/var/run/secrets/kubernetes.io/serviceaccount/"
-		serviceAccountTokenPath     = serviceAccountPath + "token"
-		serviceAccountCAPath        = serviceAccountPath + "ca.crt"
-		serviceAccountNamespacePath = serviceAccountPath + "namespace"
-
-		kubernetesServiceHostENV  = "KUBERNETES_SERVICE_HOST"
-		kubernetesServicePortENV  = "KUBERNETES_SERVICE_PORT"
-		kubernetesPodNamespaceENV = "KUBERNETES_POD_NAMESPACE"
-	)
-
-	host, port := os.Getenv(kubernetesServiceHostENV), os.Getenv(kubernetesServicePortENV)
+func getInClusterConnectOptions(host, port string) (k8sapi.Cluster, error) {
 	if len(host) == 0 || len(port) == 0 {
-		return k8sapi.Cluster{}, k8sapi.AuthInfo{}, "", fmt.Errorf(
+		return k8sapi.Cluster{}, fmt.Errorf(
 			"unable to load in-cluster configuration, %s and %s must be defined",
 			kubernetesServiceHostENV,
 			kubernetesServicePortENV,
 		)
 	}
-	// we need to wrap IPv6 addresses in square brackets
-	// IPv4 also works with square brackets
-	host = "[" + host + "]"
+
 	cluster := k8sapi.Cluster{
-		Server:               "https://" + host + ":" + port,
+		Server:               "https://" + net.JoinHostPort(host, port),
 		CertificateAuthority: serviceAccountCAPath,
+	}
+	return cluster, nil
+}
+
+func inClusterConfig() (k8sapi.Cluster, k8sapi.AuthInfo, string, error) {
+	cluster, err := getInClusterConnectOptions(os.Getenv(kubernetesServiceHostENV), os.Getenv(kubernetesServicePortENV))
+	if err != nil {
+		return cluster, k8sapi.AuthInfo{}, "", err
 	}
 
 	token, err := os.ReadFile(serviceAccountTokenPath)

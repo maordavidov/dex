@@ -1,93 +1,177 @@
 package main
 
 import (
+	"context"
+	"crypto/rsa"
+	"crypto/x509"
+	"embed"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
 	"html/template"
+	"io/fs"
 	"log"
+	"math/big"
 	"net/http"
+	"net/url"
+
+	"github.com/coreos/go-oidc/v3/oidc"
 )
 
-var indexTmpl = template.Must(template.New("index.html").Parse(`<html>
-  <head>
-    <style>
-form  { display: table;      }
-p     { display: table-row;  }
-label { display: table-cell; }
-input { display: table-cell; }
-    </style>
-  </head>
-  <body>
-    <form action="/login" method="post">
-      <p>
-        <label> Authenticate for: </label>
-        <input type="text" name="cross_client" placeholder="list of client-ids">
-      </p>
-      <p>
-        <label>Extra scopes: </label>
-        <input type="text" name="extra_scopes" placeholder="list of scopes">
-      </p>
-      <p>
-        <label>Connector ID: </label>
-        <input type="text" name="connector_id" placeholder="connector id">
-      </p>
-      <p>
-        <label>Request offline access: </label>
-        <input type="checkbox" name="offline_access" value="yes" checked>
-      </p>
-      <p>
-	    <input type="submit" value="Login">
-      </p>
-    </form>
-  </body>
-</html>`))
+//go:embed templates/*.html
+var templatesFS embed.FS
 
-func renderIndex(w http.ResponseWriter) {
-	renderTemplate(w, indexTmpl, nil)
+//go:embed static/*
+var staticFS embed.FS
+
+const dexLogoDataURI = "/static/dex-glyph-color.svg"
+
+var (
+	indexTmpl     *template.Template
+	tokenTmpl     *template.Template
+	deviceTmpl    *template.Template
+	staticHandler http.Handler
+)
+
+func init() {
+	var err error
+	indexTmpl, err = template.ParseFS(templatesFS, "templates/index.html")
+	if err != nil {
+		log.Fatalf("failed to parse index template: %v", err)
+	}
+
+	tokenTmpl, err = template.ParseFS(templatesFS, "templates/token.html")
+	if err != nil {
+		log.Fatalf("failed to parse token template: %v", err)
+	}
+
+	deviceTmpl, err = template.ParseFS(templatesFS, "templates/device.html")
+	if err != nil {
+		log.Fatalf("failed to parse device template: %v", err)
+	}
+
+	// Create handler for static files
+	staticSubFS, err := fs.Sub(staticFS, "static")
+	if err != nil {
+		log.Fatalf("failed to create static sub filesystem: %v", err)
+	}
+	staticHandler = http.FileServer(http.FS(staticSubFS))
+}
+
+func renderIndex(w http.ResponseWriter, data indexPageData) {
+	renderTemplate(w, indexTmpl, data)
+}
+
+func renderDevice(w http.ResponseWriter, data devicePageData) {
+	renderTemplate(w, deviceTmpl, data)
+}
+
+type indexPageData struct {
+	ScopesSupported []string
+	LogoURI         string
+}
+
+type devicePageData struct {
+	SessionID       string
+	DeviceCode      string
+	UserCode        string
+	VerificationURI string
+	PollInterval    int
+	LogoURI         string
 }
 
 type tokenTmplData struct {
-	IDToken      string
-	AccessToken  string
-	RefreshToken string
-	RedirectURL  string
-	Claims       string
+	IDToken            string
+	IDTokenJWTLink     string
+	AccessToken        string
+	AccessTokenJWTLink string
+	RefreshToken       string
+	RedirectURL        string
+	Claims             string
+	PublicKeyPEM       string
 }
 
-var tokenTmpl = template.Must(template.New("token.html").Parse(`<html>
-  <head>
-    <style>
-/* make pre wrap */
-pre {
- white-space: pre-wrap;       /* css-3 */
- white-space: -moz-pre-wrap;  /* Mozilla, since 1999 */
- white-space: -pre-wrap;      /* Opera 4-6 */
- white-space: -o-pre-wrap;    /* Opera 7 */
- word-wrap: break-word;       /* Internet Explorer 5.5+ */
+func generateJWTIOLink(token string, provider *oidc.Provider, ctx context.Context) string {
+	// JWT.io doesn't support automatic public key via URL parameter
+	// The public key is displayed separately on the page for manual copy-paste
+	return "https://jwt.io/#debugger-io?token=" + url.QueryEscape(token)
 }
-    </style>
-  </head>
-  <body>
-    <p> ID Token: <pre><code>{{ .IDToken }}</code></pre></p>
-    <p> Access Token: <pre><code>{{ .AccessToken }}</code></pre></p>
-    <p> Claims: <pre><code>{{ .Claims }}</code></pre></p>
-	{{ if .RefreshToken }}
-    <p> Refresh Token: <pre><code>{{ .RefreshToken }}</code></pre></p>
-	<form action="{{ .RedirectURL }}" method="post">
-	  <input type="hidden" name="refresh_token" value="{{ .RefreshToken }}">
-	  <input type="submit" value="Redeem refresh token">
-    </form>
-	{{ end }}
-  </body>
-</html>
-`))
 
-func renderToken(w http.ResponseWriter, redirectURL, idToken, accessToken, refreshToken, claims string) {
-	renderTemplate(w, tokenTmpl, tokenTmplData{
-		IDToken:      idToken,
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		RedirectURL:  redirectURL,
-		Claims:       claims,
+func getPublicKeyPEM(provider *oidc.Provider) string {
+	if provider == nil {
+		return ""
+	}
+
+	jwksURL := provider.Endpoint().AuthURL
+	if len(jwksURL) > 5 {
+		jwksURL = jwksURL[:len(jwksURL)-5] + "/keys"
+	} else {
+		return ""
+	}
+
+	resp, err := http.Get(jwksURL)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var jwks struct {
+		Keys []json.RawMessage `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil || len(jwks.Keys) == 0 {
+		return ""
+	}
+
+	var key struct {
+		N   string `json:"n"`
+		E   string `json:"e"`
+		Kty string `json:"kty"`
+	}
+	if err := json.Unmarshal(jwks.Keys[0], &key); err != nil || key.Kty != "RSA" {
+		return ""
+	}
+
+	nBytes, err1 := base64.RawURLEncoding.DecodeString(key.N)
+	eBytes, err2 := base64.RawURLEncoding.DecodeString(key.E)
+	if err1 != nil || err2 != nil {
+		return ""
+	}
+
+	var eInt int
+	for _, b := range eBytes {
+		eInt = eInt<<8 | int(b)
+	}
+
+	pubKey := &rsa.PublicKey{
+		N: new(big.Int).SetBytes(nBytes),
+		E: eInt,
+	}
+
+	pubKeyBytes, err := x509.MarshalPKIXPublicKey(pubKey)
+	if err != nil {
+		return ""
+	}
+
+	pubKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: pubKeyBytes,
 	})
+
+	return string(pubKeyPEM)
+}
+
+func renderToken(w http.ResponseWriter, ctx context.Context, provider *oidc.Provider, redirectURL, idToken, accessToken, refreshToken, claims string) {
+	data := tokenTmplData{
+		IDToken:            idToken,
+		IDTokenJWTLink:     generateJWTIOLink(idToken, provider, ctx),
+		AccessToken:        accessToken,
+		AccessTokenJWTLink: generateJWTIOLink(accessToken, provider, ctx),
+		RefreshToken:       refreshToken,
+		RedirectURL:        redirectURL,
+		Claims:             claims,
+		PublicKeyPEM:       getPublicKeyPEM(provider),
+	}
+	renderTemplate(w, tokenTmpl, data)
 }
 
 func renderTemplate(w http.ResponseWriter, tmpl *template.Template, data interface{}) {
@@ -98,13 +182,9 @@ func renderTemplate(w http.ResponseWriter, tmpl *template.Template, data interfa
 
 	switch err := err.(type) {
 	case *template.Error:
-		// An ExecError guarantees that Execute has not written to the underlying reader.
 		log.Printf("Error rendering template %s: %s", tmpl.Name(), err)
-
-		// TODO(ericchiang): replace with better internal server error.
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 	default:
-		// An error with the underlying write, such as the connection being
-		// dropped. Ignore for now.
+		// An error with the underlying write, such as the connection being dropped. Ignore for now.
 	}
 }

@@ -7,15 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/oauth2"
 
 	"github.com/dexidp/dex/connector"
 	"github.com/dexidp/dex/pkg/groups"
-	"github.com/dexidp/dex/pkg/log"
+	"github.com/dexidp/dex/pkg/httpclient"
 )
 
 const (
@@ -28,12 +30,14 @@ const (
 
 // Config holds configuration options for gitlab logins.
 type Config struct {
-	BaseURL      string   `json:"baseURL"`
-	ClientID     string   `json:"clientID"`
-	ClientSecret string   `json:"clientSecret"`
-	RedirectURI  string   `json:"redirectURI"`
-	Groups       []string `json:"groups"`
-	UseLoginAsID bool     `json:"useLoginAsID"`
+	BaseURL             string   `json:"baseURL"`
+	ClientID            string   `json:"clientID"`
+	ClientSecret        string   `json:"clientSecret"`
+	RedirectURI         string   `json:"redirectURI"`
+	Groups              []string `json:"groups"`
+	UseLoginAsID        bool     `json:"useLoginAsID"`
+	GetGroupsPermission bool     `json:"getGroupsPermission"`
+	RootCAData          []byte   `json:"rootCAData,omitempty"`
 }
 
 type gitlabUser struct {
@@ -46,18 +50,33 @@ type gitlabUser struct {
 }
 
 // Open returns a strategy for logging in through GitLab.
-func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error) {
+func (c *Config) Open(id string, logger *slog.Logger) (connector.Connector, error) {
 	if c.BaseURL == "" {
 		c.BaseURL = "https://gitlab.com"
 	}
+	var httpClient *http.Client
+	if len(c.RootCAData) > 0 {
+		var err error
+		httpClient, err = httpclient.NewHTTPClient([]string{string(c.RootCAData)}, false)
+		if err != nil {
+			// Keep backward-compatible error semantics for invalid PEM input.
+			if strings.Contains(err.Error(), "not in PEM format") {
+				return nil, fmt.Errorf("gitlab: invalid rootCAData")
+			}
+			return nil, fmt.Errorf("gitlab: failed to create HTTP client: %v", err)
+		}
+		httpClient.Timeout = 30 * time.Second
+	}
 	return &gitlabConnector{
-		baseURL:      c.BaseURL,
-		redirectURI:  c.RedirectURI,
-		clientID:     c.ClientID,
-		clientSecret: c.ClientSecret,
-		logger:       logger,
-		groups:       c.Groups,
-		useLoginAsID: c.UseLoginAsID,
+		baseURL:             c.BaseURL,
+		redirectURI:         c.RedirectURI,
+		clientID:            c.ClientID,
+		clientSecret:        c.ClientSecret,
+		logger:              logger.With(slog.Group("connector", "type", "gitlab", "id", id)),
+		groups:              c.Groups,
+		useLoginAsID:        c.UseLoginAsID,
+		getGroupsPermission: c.GetGroupsPermission,
+		httpClient:          httpClient,
 	}, nil
 }
 
@@ -68,8 +87,9 @@ type connectorData struct {
 }
 
 var (
-	_ connector.CallbackConnector = (*gitlabConnector)(nil)
-	_ connector.RefreshConnector  = (*gitlabConnector)(nil)
+	_ connector.CallbackConnector      = (*gitlabConnector)(nil)
+	_ connector.RefreshConnector       = (*gitlabConnector)(nil)
+	_ connector.TokenIdentityConnector = (*gitlabConnector)(nil)
 )
 
 type gitlabConnector struct {
@@ -78,10 +98,13 @@ type gitlabConnector struct {
 	groups       []string
 	clientID     string
 	clientSecret string
-	logger       log.Logger
+	logger       *slog.Logger
 	httpClient   *http.Client
 	// if set to true will use the user's handle rather than their numeric id as the ID
 	useLoginAsID bool
+
+	// if set to true permissions will be added to list of groups
+	getGroupsPermission bool
 }
 
 func (c *gitlabConnector) oauth2Config(scopes connector.Scopes) *oauth2.Config {
@@ -100,11 +123,11 @@ func (c *gitlabConnector) oauth2Config(scopes connector.Scopes) *oauth2.Config {
 	}
 }
 
-func (c *gitlabConnector) LoginURL(scopes connector.Scopes, callbackURL, state string) (string, error) {
+func (c *gitlabConnector) LoginURL(scopes connector.Scopes, callbackURL, state string) (string, []byte, error) {
 	if c.redirectURI != callbackURL {
-		return "", fmt.Errorf("expected callback URL %q did not match the URL in the config %q", c.redirectURI, callbackURL)
+		return "", nil, fmt.Errorf("expected callback URL %q did not match the URL in the config %q", c.redirectURI, callbackURL)
 	}
-	return c.oauth2Config(scopes).AuthCodeURL(state), nil
+	return c.oauth2Config(scopes).AuthCodeURL(state), nil, nil
 }
 
 type oauth2Error struct {
@@ -119,7 +142,7 @@ func (e *oauth2Error) Error() string {
 	return e.error + ": " + e.errorDescription
 }
 
-func (c *gitlabConnector) HandleCallback(s connector.Scopes, r *http.Request) (identity connector.Identity, err error) {
+func (c *gitlabConnector) HandleCallback(s connector.Scopes, connData []byte, r *http.Request) (identity connector.Identity, err error) {
 	q := r.URL.Query()
 	if errType := q.Get("error"); errType != "" {
 		return identity, &oauth2Error{errType, q.Get("error_description")}
@@ -221,6 +244,34 @@ func (c *gitlabConnector) Refresh(ctx context.Context, s connector.Scopes, ident
 	}
 }
 
+// TokenIdentity is used for token exchange, verifying a GitLab access token
+// and returning the associated user identity. This enables direct authentication
+// with Dex using an existing GitLab token without going through the OAuth flow.
+//
+// Note: The connector decides whether to fetch groups based on its configuration
+// (groups filter, getGroupsPermission), not on the scopes from the token exchange request.
+// The server will then decide whether to include groups in the final token based on
+// the requested scopes. This matches the behavior of other connectors (e.g., OIDC).
+func (c *gitlabConnector) TokenIdentity(ctx context.Context, _, subjectToken string) (connector.Identity, error) {
+	if c.httpClient != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, c.httpClient)
+	}
+
+	token := &oauth2.Token{
+		AccessToken: subjectToken,
+		TokenType:   "Bearer", // GitLab tokens are typically Bearer tokens even if the type is not explicitly provided.
+	}
+
+	// For token exchange, we determine if groups should be fetched based on connector configuration.
+	// If the connector has groups filter or getGroupsPermission enabled, we fetch groups.
+	scopes := connector.Scopes{
+		// Scopes are not provided in token exchange, so we request groups every time and return only if configured.
+		Groups: true,
+	}
+
+	return c.identity(ctx, scopes, token)
+}
+
 func (c *gitlabConnector) groupsRequired(groupScope bool) bool {
 	return len(c.groups) > 0 || groupScope
 }
@@ -256,7 +307,10 @@ func (c *gitlabConnector) user(ctx context.Context, client *http.Client) (gitlab
 }
 
 type userInfo struct {
-	Groups []string
+	Groups               []string `json:"groups"`
+	OwnerPermission      []string `json:"https://gitlab.org/claims/groups/owner"`
+	MaintainerPermission []string `json:"https://gitlab.org/claims/groups/maintainer"`
+	DeveloperPermission  []string `json:"https://gitlab.org/claims/groups/developer"`
 }
 
 // userGroups queries the GitLab API for group membership.
@@ -287,7 +341,60 @@ func (c *gitlabConnector) userGroups(ctx context.Context, client *http.Client) (
 		return nil, fmt.Errorf("failed to decode response: %v", err)
 	}
 
+	if c.getGroupsPermission {
+		groups := c.setGroupsPermission(u)
+		return groups, nil
+	}
+
 	return u.Groups, nil
+}
+
+func (c *gitlabConnector) setGroupsPermission(u userInfo) []string {
+	groups := u.Groups
+
+L1:
+	for _, g := range groups {
+		for _, op := range u.OwnerPermission {
+			if g == op {
+				groups = append(groups, fmt.Sprintf("%s:owner", g))
+				continue L1
+			}
+			if len(g) > len(op) {
+				if g[0:len(op)] == op && string(g[len(op)]) == "/" {
+					groups = append(groups, fmt.Sprintf("%s:owner", g))
+					continue L1
+				}
+			}
+		}
+
+		for _, mp := range u.MaintainerPermission {
+			if g == mp {
+				groups = append(groups, fmt.Sprintf("%s:maintainer", g))
+				continue L1
+			}
+			if len(g) > len(mp) {
+				if g[0:len(mp)] == mp && string(g[len(mp)]) == "/" {
+					groups = append(groups, fmt.Sprintf("%s:maintainer", g))
+					continue L1
+				}
+			}
+		}
+
+		for _, dp := range u.DeveloperPermission {
+			if g == dp {
+				groups = append(groups, fmt.Sprintf("%s:developer", g))
+				continue L1
+			}
+			if len(g) > len(dp) {
+				if g[0:len(dp)] == dp && string(g[len(dp)]) == "/" {
+					groups = append(groups, fmt.Sprintf("%s:developer", g))
+					continue L1
+				}
+			}
+		}
+	}
+
+	return groups
 }
 
 func (c *gitlabConnector) getGroups(ctx context.Context, client *http.Client, groupScope bool, userLogin string) ([]string, error) {

@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
 	"golang.org/x/oauth2"
 
 	"github.com/dexidp/dex/connector"
-	"github.com/dexidp/dex/pkg/log"
 )
 
 const (
@@ -29,7 +29,7 @@ type Config struct {
 }
 
 // Open returns a strategy for logging in through LinkedIn
-func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error) {
+func (c *Config) Open(id string, logger *slog.Logger) (connector.Connector, error) {
 	return &linkedInConnector{
 		oauth2Config: &oauth2.Config{
 			ClientID:     c.ClientID,
@@ -41,7 +41,7 @@ func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error)
 			Scopes:      []string{"r_liteprofile", "r_emailaddress"},
 			RedirectURL: c.RedirectURI,
 		},
-		logger: logger,
+		logger: logger.With(slog.Group("connector", "type", "linkedin", "id", id)),
 	}, nil
 }
 
@@ -49,30 +49,28 @@ type connectorData struct {
 	AccessToken string `json:"accessToken"`
 }
 
-type linkedInConnector struct {
-	oauth2Config *oauth2.Config
-	logger       log.Logger
-}
-
-// LinkedIn doesn't provide refresh tokens, so refresh tokens issued by Dex
-// will expire in 60 days (default LinkedIn token lifetime).
 var (
 	_ connector.CallbackConnector = (*linkedInConnector)(nil)
 	_ connector.RefreshConnector  = (*linkedInConnector)(nil)
 )
 
+type linkedInConnector struct {
+	oauth2Config *oauth2.Config
+	logger       *slog.Logger
+}
+
 // LoginURL returns an access token request URL
-func (c *linkedInConnector) LoginURL(scopes connector.Scopes, callbackURL, state string) (string, error) {
+func (c *linkedInConnector) LoginURL(scopes connector.Scopes, callbackURL, state string) (string, []byte, error) {
 	if c.oauth2Config.RedirectURL != callbackURL {
-		return "", fmt.Errorf("expected callback URL %q did not match the URL in the config %q",
+		return "", nil, fmt.Errorf("expected callback URL %q did not match the URL in the config %q",
 			callbackURL, c.oauth2Config.RedirectURL)
 	}
 
-	return c.oauth2Config.AuthCodeURL(state), nil
+	return c.oauth2Config.AuthCodeURL(state), nil, nil
 }
 
 // HandleCallback handles HTTP redirect from LinkedIn
-func (c *linkedInConnector) HandleCallback(s connector.Scopes, r *http.Request) (identity connector.Identity, err error) {
+func (c *linkedInConnector) HandleCallback(s connector.Scopes, connData []byte, r *http.Request) (identity connector.Identity, err error) {
 	q := r.URL.Query()
 	if errType := q.Get("error"); errType != "" {
 		return identity, &oauth2Error{errType, q.Get("error_description")}

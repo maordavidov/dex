@@ -1,18 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"strings"
 
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/dexidp/dex/pkg/featureflags"
-	"github.com/dexidp/dex/pkg/log"
 	"github.com/dexidp/dex/server"
+	"github.com/dexidp/dex/server/signer"
 	"github.com/dexidp/dex/storage"
 	"github.com/dexidp/dex/storage/ent"
 	"github.com/dexidp/dex/storage/etcd"
@@ -20,6 +23,15 @@ import (
 	"github.com/dexidp/dex/storage/memory"
 	"github.com/dexidp/dex/storage/sql"
 )
+
+func configUnmarshaller(b []byte, v interface{}) error {
+	if !featureflags.ConfigDisallowUnknownFields.Enabled() {
+		return json.Unmarshal(b, v)
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
 
 // Config is the config format for the main application.
 type Config struct {
@@ -33,6 +45,9 @@ type Config struct {
 	Logger    Logger    `json:"logger"`
 
 	Frontend server.WebConfig `json:"frontend"`
+
+	// Signer configuration controls signing of JWT tokens issued by Dex.
+	Signer Signer `json:"signer"`
 
 	// StaticConnectors are user defined connectors specified in the ConfigMap
 	// Write operations, like updating a connector, will fail.
@@ -84,6 +99,7 @@ func (c Config) Validate() error {
 			checkErrors = append(checkErrors, check.errMsg)
 		}
 	}
+
 	if len(checkErrors) != 0 {
 		return fmt.Errorf("invalid Config:\n\t-\t%s", strings.Join(checkErrors, "\n\t-\t"))
 	}
@@ -94,19 +110,27 @@ type password storage.Password
 
 func (p *password) UnmarshalJSON(b []byte) error {
 	var data struct {
-		Email       string `json:"email"`
-		Username    string `json:"username"`
-		UserID      string `json:"userID"`
-		Hash        string `json:"hash"`
-		HashFromEnv string `json:"hashFromEnv"`
+		Email             string   `json:"email"`
+		Username          string   `json:"username"`
+		Name              string   `json:"name"`
+		PreferredUsername string   `json:"preferredUsername"`
+		EmailVerified     *bool    `json:"emailVerified"`
+		UserID            string   `json:"userID"`
+		Hash              string   `json:"hash"`
+		HashFromEnv       string   `json:"hashFromEnv"`
+		Groups            []string `json:"groups"`
 	}
-	if err := json.Unmarshal(b, &data); err != nil {
+	if err := configUnmarshaller(b, &data); err != nil {
 		return err
 	}
 	*p = password(storage.Password{
-		Email:    data.Email,
-		Username: data.Username,
-		UserID:   data.UserID,
+		Email:             data.Email,
+		Username:          data.Username,
+		Name:              data.Name,
+		PreferredUsername: data.PreferredUsername,
+		EmailVerified:     data.EmailVerified,
+		UserID:            data.UserID,
+		Groups:            data.Groups,
 	})
 	if len(data.Hash) == 0 && len(data.HashFromEnv) > 0 {
 		data.Hash = os.Getenv(data.HashFromEnv)
@@ -148,19 +172,52 @@ type OAuth2 struct {
 	AlwaysShowLoginScreen bool `json:"alwaysShowLoginScreen"`
 	// This is the connector that can be used for password grant
 	PasswordConnector string `json:"passwordConnector"`
+	// PKCE configuration
+	PKCE PKCE `json:"pkce"`
+}
+
+// PKCE holds the PKCE (Proof Key for Code Exchange) configuration.
+type PKCE struct {
+	// If true, PKCE is required for all authorization code flows.
+	Enforce bool `json:"enforce"`
+	// Supported code challenge methods. Defaults to ["S256", "plain"].
+	CodeChallengeMethodsSupported []string `json:"codeChallengeMethodsSupported"`
 }
 
 // Web is the config format for the HTTP server.
 type Web struct {
-	HTTP           string   `json:"http"`
-	HTTPS          string   `json:"https"`
-	Headers        Headers  `json:"headers"`
-	TLSCert        string   `json:"tlsCert"`
-	TLSKey         string   `json:"tlsKey"`
-	TLSMinVersion  string   `json:"tlsMinVersion"`
-	TLSMaxVersion  string   `json:"tlsMaxVersion"`
-	AllowedOrigins []string `json:"allowedOrigins"`
-	AllowedHeaders []string `json:"allowedHeaders"`
+	HTTP           string         `json:"http"`
+	HTTPS          string         `json:"https"`
+	Headers        Headers        `json:"headers"`
+	TLSCert        string         `json:"tlsCert"`
+	TLSKey         string         `json:"tlsKey"`
+	TLSMinVersion  string         `json:"tlsMinVersion"`
+	TLSMaxVersion  string         `json:"tlsMaxVersion"`
+	AllowedOrigins []string       `json:"allowedOrigins"`
+	AllowedHeaders []string       `json:"allowedHeaders"`
+	ClientRemoteIP ClientRemoteIP `json:"clientRemoteIP"`
+}
+
+type ClientRemoteIP struct {
+	Header         string   `json:"header"`
+	TrustedProxies []string `json:"trustedProxies"`
+}
+
+func (cr *ClientRemoteIP) ParseTrustedProxies() ([]netip.Prefix, error) {
+	if cr == nil {
+		return nil, nil
+	}
+
+	trusted := make([]netip.Prefix, 0, len(cr.TrustedProxies))
+	for _, cidr := range cr.TrustedProxies {
+		ipNet, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse CIDR %q: %v", cidr, err)
+		}
+		trusted = append(trusted, ipNet)
+	}
+
+	return trusted, nil
 }
 
 type Headers struct {
@@ -236,7 +293,7 @@ type Storage struct {
 
 // StorageConfig is a configuration that can create a storage.
 type StorageConfig interface {
-	Open(logger log.Logger) (storage.Storage, error)
+	Open(logger *slog.Logger) (storage.Storage, error)
 }
 
 var (
@@ -251,12 +308,33 @@ var (
 	_ StorageConfig = (*ent.MySQL)(nil)
 )
 
-func getORMBasedSQLStorage(normal, entBased StorageConfig) func() StorageConfig {
+func getORMBasedSQLStorage(normal, entBased func() StorageConfig) func() StorageConfig {
 	return func() StorageConfig {
 		if featureflags.EntEnabled.Enabled() {
-			return entBased
+			return entBased()
 		}
-		return normal
+		return normal()
+	}
+}
+
+// Recursively expand environment variables in the map to avoid
+// issues with JSON special characters and escapes
+func expandEnvInMap(m map[string]interface{}) {
+	for k, v := range m {
+		switch vt := v.(type) {
+		case string:
+			m[k] = os.ExpandEnv(vt)
+		case map[string]interface{}:
+			expandEnvInMap(vt)
+		case []interface{}:
+			for i, item := range vt {
+				if itemMap, ok := item.(map[string]interface{}); ok {
+					expandEnvInMap(itemMap)
+				} else if itemString, ok := item.(string); ok {
+					vt[i] = os.ExpandEnv(itemString)
+				}
+			}
+		}
 	}
 }
 
@@ -264,9 +342,9 @@ var storages = map[string]func() StorageConfig{
 	"etcd":       func() StorageConfig { return new(etcd.Etcd) },
 	"kubernetes": func() StorageConfig { return new(kubernetes.Config) },
 	"memory":     func() StorageConfig { return new(memory.Config) },
-	"sqlite3":    getORMBasedSQLStorage(&sql.SQLite3{}, &ent.SQLite3{}),
-	"postgres":   getORMBasedSQLStorage(&sql.Postgres{}, &ent.Postgres{}),
-	"mysql":      getORMBasedSQLStorage(&sql.MySQL{}, &ent.MySQL{}),
+	"sqlite3":    getORMBasedSQLStorage(func() StorageConfig { return new(sql.SQLite3) }, func() StorageConfig { return new(ent.SQLite3) }),
+	"postgres":   getORMBasedSQLStorage(func() StorageConfig { return new(sql.Postgres) }, func() StorageConfig { return new(ent.Postgres) }),
+	"mysql":      getORMBasedSQLStorage(func() StorageConfig { return new(sql.MySQL) }, func() StorageConfig { return new(ent.MySQL) }),
 }
 
 // UnmarshalJSON allows Storage to implement the unmarshaler interface to
@@ -276,7 +354,7 @@ func (s *Storage) UnmarshalJSON(b []byte) error {
 		Type   string          `json:"type"`
 		Config json.RawMessage `json:"config"`
 	}
-	if err := json.Unmarshal(b, &store); err != nil {
+	if err := configUnmarshaller(b, &store); err != nil {
 		return fmt.Errorf("parse storage: %v", err)
 	}
 	f, ok := storages[store.Type]
@@ -288,16 +366,99 @@ func (s *Storage) UnmarshalJSON(b []byte) error {
 	if len(store.Config) != 0 {
 		data := []byte(store.Config)
 		if featureflags.ExpandEnv.Enabled() {
-			// Caution, we're expanding in the raw JSON/YAML source. This may not be what the admin expects.
-			data = []byte(os.ExpandEnv(string(store.Config)))
+			var rawMap map[string]interface{}
+			if err := configUnmarshaller(store.Config, &rawMap); err != nil {
+				return fmt.Errorf("unmarshal config for env expansion: %v", err)
+			}
+
+			// Recursively expand environment variables in the map to avoid
+			// issues with JSON special characters and escapes
+			expandEnvInMap(rawMap)
+
+			// Marshal the expanded map back to JSON
+			expandedData, err := json.Marshal(rawMap)
+			if err != nil {
+				return fmt.Errorf("marshal expanded config: %v", err)
+			}
+
+			data = expandedData
 		}
-		if err := json.Unmarshal(data, storageConfig); err != nil {
+
+		if err := configUnmarshaller(data, storageConfig); err != nil {
 			return fmt.Errorf("parse storage config: %v", err)
 		}
 	}
 	*s = Storage{
 		Type:   store.Type,
 		Config: storageConfig,
+	}
+	return nil
+}
+
+// Signer holds app's signer configuration.
+type Signer struct {
+	Type   string       `json:"type"`
+	Config SignerConfig `json:"config"`
+}
+
+// SignerConfig is a configuration that can create a signer.
+type SignerConfig interface{}
+
+var (
+	_ SignerConfig = (*signer.LocalConfig)(nil)
+	_ SignerConfig = (*signer.VaultConfig)(nil)
+)
+
+var signerConfigs = map[string]func() SignerConfig{
+	"local": func() SignerConfig { return new(signer.LocalConfig) },
+	"vault": func() SignerConfig { return new(signer.VaultConfig) },
+}
+
+// UnmarshalJSON allows Signer to implement the unmarshaler interface to
+// dynamically determine the type of the signer config.
+func (s *Signer) UnmarshalJSON(b []byte) error {
+	var signerData struct {
+		Type   string          `json:"type"`
+		Config json.RawMessage `json:"config"`
+	}
+	if err := json.Unmarshal(b, &signerData); err != nil {
+		return fmt.Errorf("parse signer: %v", err)
+	}
+
+	f, ok := signerConfigs[signerData.Type]
+	if !ok {
+		return fmt.Errorf("unknown signer type %q", signerData.Type)
+	}
+
+	signerConfig := f()
+	if len(signerData.Config) != 0 {
+		data := []byte(signerData.Config)
+		if featureflags.ExpandEnv.Enabled() {
+			var rawMap map[string]interface{}
+			if err := json.Unmarshal(signerData.Config, &rawMap); err != nil {
+				return fmt.Errorf("unmarshal config for env expansion: %v", err)
+			}
+
+			// Recursively expand environment variables in the map
+			expandEnvInMap(rawMap)
+
+			// Marshal the expanded map back to JSON
+			expandedData, err := json.Marshal(rawMap)
+			if err != nil {
+				return fmt.Errorf("marshal expanded config: %v", err)
+			}
+
+			data = expandedData
+		}
+
+		if err := json.Unmarshal(data, signerConfig); err != nil {
+			return fmt.Errorf("parse signer config: %v", err)
+		}
+	}
+
+	*s = Signer{
+		Type:   signerData.Type,
+		Config: signerConfig,
 	}
 	return nil
 }
@@ -309,7 +470,8 @@ type Connector struct {
 	Name string `json:"name"`
 	ID   string `json:"id"`
 
-	Config server.ConnectorConfig `json:"config"`
+	Config     server.ConnectorConfig `json:"config"`
+	GrantTypes []string               `json:"grantTypes"`
 }
 
 // UnmarshalJSON allows Connector to implement the unmarshaler interface to
@@ -320,9 +482,10 @@ func (c *Connector) UnmarshalJSON(b []byte) error {
 		Name string `json:"name"`
 		ID   string `json:"id"`
 
-		Config json.RawMessage `json:"config"`
+		Config     json.RawMessage `json:"config"`
+		GrantTypes []string        `json:"grantTypes"`
 	}
-	if err := json.Unmarshal(b, &conn); err != nil {
+	if err := configUnmarshaller(b, &conn); err != nil {
 		return fmt.Errorf("parse connector: %v", err)
 	}
 	f, ok := server.ConnectorsConfig[conn.Type]
@@ -334,18 +497,35 @@ func (c *Connector) UnmarshalJSON(b []byte) error {
 	if len(conn.Config) != 0 {
 		data := []byte(conn.Config)
 		if featureflags.ExpandEnv.Enabled() {
-			// Caution, we're expanding in the raw JSON/YAML source. This may not be what the admin expects.
-			data = []byte(os.ExpandEnv(string(conn.Config)))
+			var rawMap map[string]interface{}
+			if err := configUnmarshaller(conn.Config, &rawMap); err != nil {
+				return fmt.Errorf("unmarshal config for env expansion: %v", err)
+			}
+
+			// Recursively expand environment variables in the map to avoid
+			// issues with JSON special characters and escapes
+			expandEnvInMap(rawMap)
+
+			// Marshal the expanded map back to JSON
+			expandedData, err := json.Marshal(rawMap)
+			if err != nil {
+				return fmt.Errorf("marshal expanded config: %v", err)
+			}
+
+			data = expandedData
 		}
-		if err := json.Unmarshal(data, connConfig); err != nil {
+
+		if err := configUnmarshaller(data, connConfig); err != nil {
 			return fmt.Errorf("parse connector config: %v", err)
 		}
 	}
+
 	*c = Connector{
-		Type:   conn.Type,
-		Name:   conn.Name,
-		ID:     conn.ID,
-		Config: connConfig,
+		Type:       conn.Type,
+		Name:       conn.Name,
+		ID:         conn.ID,
+		Config:     connConfig,
+		GrantTypes: conn.GrantTypes,
 	}
 	return nil
 }
@@ -358,10 +538,11 @@ func ToStorageConnector(c Connector) (storage.Connector, error) {
 	}
 
 	return storage.Connector{
-		ID:     c.ID,
-		Type:   c.Type,
-		Name:   c.Name,
-		Config: data,
+		ID:         c.ID,
+		Type:       c.Type,
+		Name:       c.Name,
+		Config:     data,
+		GrantTypes: c.GrantTypes,
 	}, nil
 }
 
@@ -386,7 +567,7 @@ type Expiry struct {
 // Logger holds configuration required to customize logging for dex.
 type Logger struct {
 	// Level sets logging level severity.
-	Level string `json:"level"`
+	Level slog.Level `json:"level"`
 
 	// Format specifies the format to be used for logging.
 	Format string `json:"format"`

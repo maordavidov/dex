@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -29,7 +28,7 @@ func toJSON(a interface{}) string {
 }
 
 func mockTestStorage(t *testing.T, s storage.Storage) {
-	ctx := context.Background()
+	ctx := t.Context()
 	c := storage.Client{
 		ID:           "test",
 		Secret:       "barfoo",
@@ -137,17 +136,24 @@ func getIntrospectionValue(issuerURL url.URL, issuedAt time.Time, expiry time.Ti
 
 func TestGetTokenFromRequestSuccess(t *testing.T) {
 	t0 := time.Now()
+	ctx := t.Context()
 
 	now := func() time.Time { return t0 }
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	// Setup a dex server.
-	httpServer, s := newTestServer(ctx, t, func(c *Config) {
+	httpServer, s := newTestServer(t, func(c *Config) {
 		c.Issuer += "/non-root-path"
 		c.Now = now
 	})
 	defer httpServer.Close()
+
+	mockTestStorage(t, s.storage)
+
+	// Generate a valid RS256-signed access token
+	accessToken, _, err := s.newIDToken(ctx, "test", storage.Claims{
+		UserID:   "1",
+		Username: "jane",
+	}, []string{"openid"}, "nonce", "", "", "test")
+	require.NoError(t, err)
 
 	tests := []struct {
 		testName          string
@@ -157,7 +163,7 @@ func TestGetTokenFromRequestSuccess(t *testing.T) {
 		// Access Token
 		{
 			testName:          "Access Token",
-			expectedToken:     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+			expectedToken:     accessToken,
 			expectedTokenType: AccessToken,
 		},
 		// Refresh Token
@@ -201,11 +207,9 @@ func TestGetTokenFromRequestFailure(t *testing.T) {
 	t0 := time.Now()
 
 	now := func() time.Time { return t0 }
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Setup a dex server.
-	httpServer, s := newTestServer(ctx, t, func(c *Config) {
+	httpServer, s := newTestServer(t, func(c *Config) {
 		c.Issuer += "/non-root-path"
 		c.Now = now
 	})
@@ -238,11 +242,12 @@ func TestGetTokenFromRequestFailure(t *testing.T) {
 func TestHandleIntrospect(t *testing.T) {
 	t0 := time.Now()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	// Setup a dex server.
 	now := func() time.Time { return t0 }
+
+	logger := newLogger(t)
 
 	refreshTokenPolicy, err := NewRefreshTokenPolicy(logger, false, "", "24h", "")
 	if err != nil {
@@ -250,7 +255,7 @@ func TestHandleIntrospect(t *testing.T) {
 	}
 	refreshTokenPolicy.now = now
 
-	httpServer, s := newTestServer(ctx, t, func(c *Config) {
+	httpServer, s := newTestServer(t, func(c *Config) {
 		c.Issuer += "/non-root-path"
 		c.RefreshTokenPolicy = refreshTokenPolicy
 		c.Now = now
@@ -259,7 +264,7 @@ func TestHandleIntrospect(t *testing.T) {
 
 	mockTestStorage(t, s.storage)
 
-	activeAccessToken, expiry, err := s.newIDToken("test", storage.Claims{
+	activeAccessToken, expiry, err := s.newIDToken(ctx, "test", storage.Claims{
 		UserID:        "1",
 		Username:      "jane",
 		Email:         "jane.doe@example.com",
@@ -293,7 +298,7 @@ func TestHandleIntrospect(t *testing.T) {
 		{
 			testName:           "Access Token: active",
 			token:              activeAccessToken,
-			response:           toJSON(getIntrospectionValue(s.issuerURL, time.Now(), expiry, "access_token")),
+			response:           toJSON(getIntrospectionValue(s.issuerURL, t0, expiry, "access_token")),
 			responseStatusCode: 200,
 		},
 		{
@@ -306,7 +311,7 @@ func TestHandleIntrospect(t *testing.T) {
 		{
 			testName:           "Refresh Token: active",
 			token:              activeRefreshToken,
-			response:           toJSON(getIntrospectionValue(s.issuerURL, time.Now(), time.Now().Add(s.refreshTokenPolicy.absoluteLifetime), "refresh_token")),
+			response:           toJSON(getIntrospectionValue(s.issuerURL, t0, t0.Add(s.refreshTokenPolicy.absoluteLifetime), "refresh_token")),
 			responseStatusCode: 200,
 		},
 		{
@@ -361,11 +366,9 @@ func TestIntrospectErrHelper(t *testing.T) {
 	t0 := time.Now()
 
 	now := func() time.Time { return t0 }
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Setup a dex server.
-	httpServer, s := newTestServer(ctx, t, func(c *Config) {
+	httpServer, s := newTestServer(t, func(c *Config) {
 		c.Issuer += "/non-root-path"
 		c.Now = now
 	})

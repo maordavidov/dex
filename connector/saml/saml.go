@@ -3,11 +3,14 @@ package saml
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"encoding/xml"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -21,10 +24,8 @@ import (
 
 	"github.com/dexidp/dex/connector"
 	"github.com/dexidp/dex/pkg/groups"
-	"github.com/dexidp/dex/pkg/log"
 )
 
-//nolint
 const (
 	bindingRedirect = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"
 	bindingPOST     = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
@@ -120,11 +121,12 @@ func (c certStore) Certificates() (roots []*x509.Certificate, err error) {
 
 // Open validates the config and returns a connector. It does not actually
 // validate connectivity with the provider.
-func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error) {
+func (c *Config) Open(id string, logger *slog.Logger) (connector.Connector, error) {
+	logger = logger.With(slog.Group("connector", "type", "saml", "id", id))
 	return c.openConnector(logger)
 }
 
-func (c *Config) openConnector(logger log.Logger) (*provider, error) {
+func (c *Config) openConnector(logger *slog.Logger) (*provider, error) {
 	requiredFields := []struct {
 		name, val string
 	}{
@@ -230,6 +232,11 @@ func (c *Config) openConnector(logger log.Logger) (*provider, error) {
 	return p, nil
 }
 
+var (
+	_ connector.SAMLConnector    = (*provider)(nil)
+	_ connector.RefreshConnector = (*provider)(nil)
+)
+
 type provider struct {
 	entityIssuer string
 	ssoIssuer    string
@@ -252,7 +259,37 @@ type provider struct {
 
 	nameIDPolicyFormat string
 
-	logger log.Logger
+	logger *slog.Logger
+}
+
+// cachedIdentity stores the identity from SAML assertion for refresh token support.
+// Since SAML has no native refresh mechanism, we cache the identity obtained during
+// the initial authentication and return it on subsequent refresh requests.
+type cachedIdentity struct {
+	UserID            string   `json:"userId"`
+	Username          string   `json:"username"`
+	PreferredUsername string   `json:"preferredUsername"`
+	Email             string   `json:"email"`
+	EmailVerified     bool     `json:"emailVerified"`
+	Groups            []string `json:"groups,omitempty"`
+}
+
+// marshalCachedIdentity serializes the identity into ConnectorData for refresh token support.
+func marshalCachedIdentity(ident connector.Identity) (connector.Identity, error) {
+	ci := cachedIdentity{
+		UserID:            ident.UserID,
+		Username:          ident.Username,
+		PreferredUsername: ident.PreferredUsername,
+		Email:             ident.Email,
+		EmailVerified:     ident.EmailVerified,
+		Groups:            ident.Groups,
+	}
+	connectorData, err := json.Marshal(ci)
+	if err != nil {
+		return ident, fmt.Errorf("saml: failed to marshal cached identity: %v", err)
+	}
+	ident.ConnectorData = connectorData
+	return ident, nil
 }
 
 func (p *provider) POSTData(s connector.Scopes, id string) (action, value string, err error) {
@@ -389,7 +426,7 @@ func (p *provider) HandlePOST(s connector.Scopes, samlResponse, inResponseTo str
 	// Log the actual attributes we got back from the server. This helps debug
 	// configuration errors on the server side, where the SAML server doesn't
 	// send us the correct attributes.
-	p.logger.Infof("parsed and verified saml response attributes %s", attributes)
+	p.logger.Info("parsed and verified saml response attributes", "attributes", attributes)
 
 	// Grab the email.
 	if ident.Email, _ = attributes.get(p.emailAttr); ident.Email == "" {
@@ -405,7 +442,7 @@ func (p *provider) HandlePOST(s connector.Scopes, samlResponse, inResponseTo str
 
 	if len(p.allowedGroups) == 0 && (!s.Groups || p.groupsAttr == "") {
 		// Groups not requested or not configured. We're done.
-		return ident, nil
+		return marshalCachedIdentity(ident)
 	}
 
 	if len(p.allowedGroups) > 0 && (!s.Groups || p.groupsAttr == "") {
@@ -431,7 +468,7 @@ func (p *provider) HandlePOST(s connector.Scopes, samlResponse, inResponseTo str
 
 	if len(p.allowedGroups) == 0 {
 		// No allowed groups set, just return the ident
-		return ident, nil
+		return marshalCachedIdentity(ident)
 	}
 
 	// Look for membership in one of the allowed groups
@@ -447,6 +484,35 @@ func (p *provider) HandlePOST(s connector.Scopes, samlResponse, inResponseTo str
 	}
 
 	// Otherwise, we're good
+	return marshalCachedIdentity(ident)
+}
+
+// Refresh implements connector.RefreshConnector.
+// Since SAML has no native refresh mechanism, this method returns the cached
+// identity from the initial SAML assertion stored in ConnectorData.
+func (p *provider) Refresh(ctx context.Context, s connector.Scopes, ident connector.Identity) (connector.Identity, error) {
+	if len(ident.ConnectorData) == 0 {
+		return ident, fmt.Errorf("saml: no connector data available for refresh")
+	}
+
+	var ci cachedIdentity
+	if err := json.Unmarshal(ident.ConnectorData, &ci); err != nil {
+		return ident, fmt.Errorf("saml: failed to unmarshal cached identity: %v", err)
+	}
+
+	ident.UserID = ci.UserID
+	ident.Username = ci.Username
+	ident.PreferredUsername = ci.PreferredUsername
+	ident.Email = ci.Email
+	ident.EmailVerified = ci.EmailVerified
+
+	// Only populate groups if the client requested the groups scope.
+	if s.Groups {
+		ident.Groups = ci.Groups
+	} else {
+		ident.Groups = nil
+	}
+
 	return ident, nil
 }
 
@@ -467,7 +533,7 @@ func (p *provider) validateStatus(status *status) error {
 		if statusMessage != nil && statusMessage.Value != "" {
 			errorMessage += " -> " + statusMessage.Value
 		}
-		return fmt.Errorf(errorMessage)
+		return errors.New(errorMessage)
 	}
 	return nil
 }
@@ -530,7 +596,7 @@ func (p *provider) validateSubject(subject *subject, inResponseTo string) error 
 	return fmt.Errorf("failed to validate subject confirmation: %v", errs)
 }
 
-// validationConditions ensures that dex is the intended audience
+// validateConditions ensures that dex is the intended audience
 // for the request, and not another service provider.
 //
 // See: https://docs.oasis-open.org/security/saml/v2.0/saml-core-2.0-os.pdf
@@ -597,6 +663,9 @@ func verifyResponseSig(validator *dsig.ValidationContext, data []byte) (signed [
 	}
 
 	response := doc.Root()
+	if response == nil {
+		return nil, false, fmt.Errorf("parse document: empty root")
+	}
 	transformedResponse, err := validator.Validate(response)
 	if err == nil {
 		// Root element is verified, return it.
@@ -609,7 +678,7 @@ func verifyResponseSig(validator *dsig.ValidationContext, data []byte) (signed [
 	//
 	// TODO: Only select from child elements of the root.
 	assertion, err := etreeutils.NSSelectOne(response, "urn:oasis:names:tc:SAML:2.0:assertion", "Assertion")
-	if err != nil {
+	if err != nil || assertion == nil {
 		return nil, false, fmt.Errorf("response does not contain an Assertion element")
 	}
 	transformedAssertion, err := validator.Validate(assertion)

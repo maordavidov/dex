@@ -89,30 +89,30 @@ type Storage interface {
 
 	// TODO(ericchiang): return (T, bool, error) so we can indicate not found
 	// requests that way instead of using ErrNotFound.
-	GetAuthRequest(id string) (AuthRequest, error)
-	GetAuthCode(id string) (AuthCode, error)
-	GetClient(id string) (Client, error)
-	GetKeys() (Keys, error)
-	GetRefresh(id string) (RefreshToken, error)
-	GetPassword(email string) (Password, error)
-	GetOfflineSessions(userID string, connID string) (OfflineSessions, error)
-	GetConnector(id string) (Connector, error)
-	GetDeviceRequest(userCode string) (DeviceRequest, error)
-	GetDeviceToken(deviceCode string) (DeviceToken, error)
+	GetAuthRequest(ctx context.Context, id string) (AuthRequest, error)
+	GetAuthCode(ctx context.Context, id string) (AuthCode, error)
+	GetClient(ctx context.Context, id string) (Client, error)
+	GetKeys(ctx context.Context) (Keys, error)
+	GetRefresh(ctx context.Context, id string) (RefreshToken, error)
+	GetPassword(ctx context.Context, email string) (Password, error)
+	GetOfflineSessions(ctx context.Context, userID string, connID string) (OfflineSessions, error)
+	GetConnector(ctx context.Context, id string) (Connector, error)
+	GetDeviceRequest(ctx context.Context, userCode string) (DeviceRequest, error)
+	GetDeviceToken(ctx context.Context, deviceCode string) (DeviceToken, error)
 
-	ListClients() ([]Client, error)
-	ListRefreshTokens() ([]RefreshToken, error)
-	ListPasswords() ([]Password, error)
-	ListConnectors() ([]Connector, error)
+	ListClients(ctx context.Context) ([]Client, error)
+	ListRefreshTokens(ctx context.Context) ([]RefreshToken, error)
+	ListPasswords(ctx context.Context) ([]Password, error)
+	ListConnectors(ctx context.Context) ([]Connector, error)
 
 	// Delete methods MUST be atomic.
-	DeleteAuthRequest(id string) error
-	DeleteAuthCode(code string) error
-	DeleteClient(id string) error
-	DeleteRefresh(id string) error
-	DeletePassword(email string) error
-	DeleteOfflineSessions(userID string, connID string) error
-	DeleteConnector(id string) error
+	DeleteAuthRequest(ctx context.Context, id string) error
+	DeleteAuthCode(ctx context.Context, code string) error
+	DeleteClient(ctx context.Context, id string) error
+	DeleteRefresh(ctx context.Context, id string) error
+	DeletePassword(ctx context.Context, email string) error
+	DeleteOfflineSessions(ctx context.Context, userID string, connID string) error
+	DeleteConnector(ctx context.Context, id string) error
 
 	// Update methods take a function for updating an object then performs that update within
 	// a transaction. "updater" functions may be called multiple times by a single update call.
@@ -128,18 +128,18 @@ type Storage interface {
 	//			// update failed, handle error
 	//		}
 	//
-	UpdateClient(id string, updater func(old Client) (Client, error)) error
-	UpdateKeys(updater func(old Keys) (Keys, error)) error
-	UpdateAuthRequest(id string, updater func(a AuthRequest) (AuthRequest, error)) error
-	UpdateRefreshToken(id string, updater func(r RefreshToken) (RefreshToken, error)) error
-	UpdatePassword(email string, updater func(p Password) (Password, error)) error
-	UpdateOfflineSessions(userID string, connID string, updater func(s OfflineSessions) (OfflineSessions, error)) error
-	UpdateConnector(id string, updater func(c Connector) (Connector, error)) error
-	UpdateDeviceToken(deviceCode string, updater func(t DeviceToken) (DeviceToken, error)) error
+	UpdateClient(ctx context.Context, id string, updater func(old Client) (Client, error)) error
+	UpdateKeys(ctx context.Context, updater func(old Keys) (Keys, error)) error
+	UpdateAuthRequest(ctx context.Context, id string, updater func(a AuthRequest) (AuthRequest, error)) error
+	UpdateRefreshToken(ctx context.Context, id string, updater func(r RefreshToken) (RefreshToken, error)) error
+	UpdatePassword(ctx context.Context, email string, updater func(p Password) (Password, error)) error
+	UpdateOfflineSessions(ctx context.Context, userID string, connID string, updater func(s OfflineSessions) (OfflineSessions, error)) error
+	UpdateConnector(ctx context.Context, id string, updater func(c Connector) (Connector, error)) error
+	UpdateDeviceToken(ctx context.Context, deviceCode string, updater func(t DeviceToken) (DeviceToken, error)) error
 
 	// GarbageCollect deletes all expired AuthCodes,
 	// AuthRequests, DeviceRequests, and DeviceTokens.
-	GarbageCollect(now time.Time) (GCResult, error)
+	GarbageCollect(ctx context.Context, now time.Time) (GCResult, error)
 }
 
 // Client represents an OAuth2 client.
@@ -149,28 +149,32 @@ type Storage interface {
 //   - Public clients: https://developers.google.com/api-client-library/python/auth/installed-app
 type Client struct {
 	// Client ID and secret used to identify the client.
-	ID        string `json:"id" yaml:"id"`
-	IDEnv     string `json:"idEnv" yaml:"idEnv"`
-	Secret    string `json:"secret" yaml:"secret"`
-	SecretEnv string `json:"secretEnv" yaml:"secretEnv"`
+	ID        string `json:"id"`
+	IDEnv     string `json:"idEnv"`
+	Secret    string `json:"secret"`
+	SecretEnv string `json:"secretEnv"`
 
 	// A registered set of redirect URIs. When redirecting from dex to the client, the URI
 	// requested to redirect to MUST match one of these values, unless the client is "public".
-	RedirectURIs []string `json:"redirectURIs" yaml:"redirectURIs"`
+	RedirectURIs []string `json:"redirectURIs"`
 
 	// TrustedPeers are a list of peers which can issue tokens on this client's behalf using
 	// the dynamic "oauth2:server:client_id:(client_id)" scope. If a peer makes such a request,
 	// this client's ID will appear as the ID Token's audience.
 	//
 	// Clients inherently trust themselves.
-	TrustedPeers []string `json:"trustedPeers" yaml:"trustedPeers"`
+	TrustedPeers []string `json:"trustedPeers"`
 
 	// Public clients must use either use a redirectURL 127.0.0.1:X or "urn:ietf:wg:oauth:2.0:oob"
-	Public bool `json:"public" yaml:"public"`
+	Public bool `json:"public"`
 
 	// Name and LogoURL used when displaying this client to the end user.
-	Name    string `json:"name" yaml:"name"`
-	LogoURL string `json:"logoURL" yaml:"logoURL"`
+	Name    string `json:"name"`
+	LogoURL string `json:"logoURL"`
+
+	// AllowedConnectors is a list of connector IDs that the client is allowed to use for authentication.
+	// If empty, all connectors are allowed.
+	AllowedConnectors []string `json:"allowedConnectors"`
 }
 
 // Claims represents the ID Token claims supported by the server.
@@ -352,8 +356,22 @@ type Password struct {
 	// Optional username to display. NOT used during login.
 	Username string `json:"username"`
 
+	// Optional full name for OIDC "name" claim.
+	// Defaults to Username when empty.
+	Name string `json:"name"`
+
+	// Optional preferred username for OIDC "preferred_username" claim.
+	PreferredUsername string `json:"preferredUsername"`
+
+	// Optional value for OIDC "email_verified" claim.
+	// Defaults to true for backwards compatibility when nil.
+	EmailVerified *bool `json:"emailVerified,omitempty"`
+
 	// Randomly generated user ID. This is NOT the primary ID of the Password object.
 	UserID string `json:"userID"`
+
+	// Groups assigned to the user
+	Groups []string `json:"groups"`
 }
 
 // Connector is an object that contains the metadata about connectors used to login to Dex.
@@ -374,6 +392,10 @@ type Connector struct {
 	// However, fixing this requires migrating Kubernetes objects for all previously created connectors,
 	// or making Dex reading both tags and act accordingly.
 	Config []byte `json:"email"`
+
+	// GrantTypes is a list of grant types that this connector is allowed to be used with.
+	// If empty, all grant types are allowed.
+	GrantTypes []string `json:"grantTypes,omitempty"`
 }
 
 // VerificationKey is a rotated signing key which can still be used to verify

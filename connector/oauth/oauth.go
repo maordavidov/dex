@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -13,8 +14,9 @@ import (
 
 	"github.com/dexidp/dex/connector"
 	"github.com/dexidp/dex/pkg/httpclient"
-	"github.com/dexidp/dex/pkg/log"
 )
+
+var _ connector.CallbackConnector = (*oauthConnector)(nil)
 
 type oauthConnector struct {
 	clientID             string
@@ -31,7 +33,7 @@ type oauthConnector struct {
 	emailVerifiedKey     string
 	groupsKey            string
 	httpClient           *http.Client
-	logger               log.Logger
+	logger               *slog.Logger
 }
 
 type connectorData struct {
@@ -58,7 +60,7 @@ type Config struct {
 	} `json:"claimMapping"`
 }
 
-func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error) {
+func (c *Config) Open(id string, logger *slog.Logger) (connector.Connector, error) {
 	var err error
 
 	userIDKey := c.UserIDKey
@@ -99,7 +101,7 @@ func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error)
 		userInfoURL:          c.UserInfoURL,
 		scopes:               c.Scopes,
 		redirectURI:          c.RedirectURI,
-		logger:               logger,
+		logger:               logger.With(slog.Group("connector", "type", "oauth", "id", id)),
 		userIDKey:            userIDKey,
 		userNameKey:          userNameKey,
 		preferredUsernameKey: preferredUsernameKey,
@@ -116,9 +118,9 @@ func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error)
 	return oauthConn, err
 }
 
-func (c *oauthConnector) LoginURL(scopes connector.Scopes, callbackURL, state string) (string, error) {
+func (c *oauthConnector) LoginURL(scopes connector.Scopes, callbackURL, state string) (string, []byte, error) {
 	if c.redirectURI != callbackURL {
-		return "", fmt.Errorf("expected callback URL %q did not match the URL in the config %q", callbackURL, c.redirectURI)
+		return "", nil, fmt.Errorf("expected callback URL %q did not match the URL in the config %q", callbackURL, c.redirectURI)
 	}
 
 	oauth2Config := &oauth2.Config{
@@ -129,10 +131,10 @@ func (c *oauthConnector) LoginURL(scopes connector.Scopes, callbackURL, state st
 		Scopes:       c.scopes,
 	}
 
-	return oauth2Config.AuthCodeURL(state), nil
+	return oauth2Config.AuthCodeURL(state), nil, nil
 }
 
-func (c *oauthConnector) HandleCallback(s connector.Scopes, r *http.Request) (identity connector.Identity, err error) {
+func (c *oauthConnector) HandleCallback(s connector.Scopes, _ []byte, r *http.Request) (identity connector.Identity, err error) {
 	q := r.URL.Query()
 	if errType := q.Get("error"); errType != "" {
 		return identity, errors.New(q.Get("error_description"))

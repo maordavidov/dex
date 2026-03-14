@@ -3,14 +3,13 @@ package sql
 
 import (
 	"database/sql"
+	"log/slog"
 	"regexp"
 	"time"
 
 	// import third party drivers
 	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
-
-	"github.com/dexidp/dex/pkg/log"
 )
 
 // flavor represents a specific SQL implementation, and is used to translate query strings
@@ -96,7 +95,7 @@ var (
 			// For compound indexes (with two keys) even less.
 			{matchLiteral("text"), "varchar(384)"},
 			// Quote keywords and reserved words used as identifiers.
-			{regexp.MustCompile(`\b(keys)\b`), "`$1`"},
+			{regexp.MustCompile(`\b(keys|groups)\b`), "`$1`"},
 			// Change default timestamp to fit datetime.
 			{regexp.MustCompile(`0001-01-01 00:00:00 UTC`), "1000-01-01 00:00:00"},
 		},
@@ -131,7 +130,7 @@ func (c *conn) translateArgs(args []interface{}) []interface{} {
 type conn struct {
 	db                 *sql.DB
 	flavor             *flavor
-	logger             log.Logger
+	logger             *slog.Logger
 	alreadyExistsCheck func(err error) bool
 }
 

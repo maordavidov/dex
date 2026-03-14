@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,7 +14,6 @@ import (
 	"testing"
 
 	"github.com/go-jose/go-jose/v4"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/dexidp/dex/connector"
@@ -50,7 +50,7 @@ func TestLoginURL(t *testing.T) {
 
 	conn := newConnector(t, testServer.URL)
 
-	loginURL, err := conn.LoginURL(connector.Scopes{}, conn.redirectURI, "some-state")
+	loginURL, _, err := conn.LoginURL(connector.Scopes{}, conn.redirectURI, "some-state")
 	assert.Equal(t, err, nil)
 
 	expectedURL, err := url.Parse(testServer.URL + "/authorize")
@@ -86,7 +86,7 @@ func TestHandleCallBackForGroupsInUserInfo(t *testing.T) {
 	conn := newConnector(t, testServer.URL)
 	req := newRequestWithAuthCode(t, testServer.URL, "TestHandleCallBackForGroupsInUserInfo")
 
-	identity, err := conn.HandleCallback(connector.Scopes{Groups: true}, req)
+	identity, err := conn.HandleCallback(connector.Scopes{Groups: true}, nil, req)
 	assert.Equal(t, err, nil)
 
 	sort.Strings(identity.Groups)
@@ -122,7 +122,7 @@ func TestHandleCallBackForGroupMapsInUserInfo(t *testing.T) {
 	conn := newConnector(t, testServer.URL)
 	req := newRequestWithAuthCode(t, testServer.URL, "TestHandleCallBackForGroupMapsInUserInfo")
 
-	identity, err := conn.HandleCallback(connector.Scopes{Groups: true}, req)
+	identity, err := conn.HandleCallback(connector.Scopes{Groups: true}, nil, req)
 	assert.Equal(t, err, nil)
 
 	sort.Strings(identity.Groups)
@@ -156,7 +156,7 @@ func TestHandleCallBackForGroupsInToken(t *testing.T) {
 	conn := newConnector(t, testServer.URL)
 	req := newRequestWithAuthCode(t, testServer.URL, "TestHandleCallBackForGroupsInToken")
 
-	identity, err := conn.HandleCallback(connector.Scopes{Groups: true}, req)
+	identity, err := conn.HandleCallback(connector.Scopes{Groups: true}, nil, req)
 	assert.Equal(t, err, nil)
 
 	assert.Equal(t, len(identity.Groups), 1)
@@ -186,7 +186,7 @@ func TestHandleCallbackForNumericUserID(t *testing.T) {
 	conn := newConnector(t, testServer.URL)
 	req := newRequestWithAuthCode(t, testServer.URL, "TestHandleCallbackForNumericUserID")
 
-	identity, err := conn.HandleCallback(connector.Scopes{Groups: true}, req)
+	identity, err := conn.HandleCallback(connector.Scopes{Groups: true}, nil, req)
 	assert.Equal(t, err, nil)
 
 	assert.Equal(t, identity.UserID, "1000")
@@ -270,7 +270,7 @@ func newConnector(t *testing.T, serverURL string) *oauthConnector {
 	testConfig.ClaimMapping.EmailKey = "mail"
 	testConfig.ClaimMapping.EmailVerifiedKey = "has_verified_email"
 
-	log := logrus.New()
+	log := slog.New(slog.DiscardHandler)
 
 	conn, err := testConfig.Open("id", log)
 	if err != nil {

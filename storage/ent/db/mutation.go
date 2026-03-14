@@ -2720,17 +2720,19 @@ func (m *AuthRequestMutation) ResetEdge(name string) error {
 // ConnectorMutation represents an operation that mutates the Connector nodes in the graph.
 type ConnectorMutation struct {
 	config
-	op               Op
-	typ              string
-	id               *string
-	_type            *string
-	name             *string
-	resource_version *string
-	_config          *[]byte
-	clearedFields    map[string]struct{}
-	done             bool
-	oldValue         func(context.Context) (*Connector, error)
-	predicates       []predicate.Connector
+	op                Op
+	typ               string
+	id                *string
+	_type             *string
+	name              *string
+	resource_version  *string
+	_config           *[]byte
+	grant_types       *[]string
+	appendgrant_types []string
+	clearedFields     map[string]struct{}
+	done              bool
+	oldValue          func(context.Context) (*Connector, error)
+	predicates        []predicate.Connector
 }
 
 var _ ent.Mutation = (*ConnectorMutation)(nil)
@@ -2981,6 +2983,71 @@ func (m *ConnectorMutation) ResetConfig() {
 	m._config = nil
 }
 
+// SetGrantTypes sets the "grant_types" field.
+func (m *ConnectorMutation) SetGrantTypes(s []string) {
+	m.grant_types = &s
+	m.appendgrant_types = nil
+}
+
+// GrantTypes returns the value of the "grant_types" field in the mutation.
+func (m *ConnectorMutation) GrantTypes() (r []string, exists bool) {
+	v := m.grant_types
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldGrantTypes returns the old "grant_types" field's value of the Connector entity.
+// If the Connector object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ConnectorMutation) OldGrantTypes(ctx context.Context) (v []string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldGrantTypes is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldGrantTypes requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldGrantTypes: %w", err)
+	}
+	return oldValue.GrantTypes, nil
+}
+
+// AppendGrantTypes adds s to the "grant_types" field.
+func (m *ConnectorMutation) AppendGrantTypes(s []string) {
+	m.appendgrant_types = append(m.appendgrant_types, s...)
+}
+
+// AppendedGrantTypes returns the list of values that were appended to the "grant_types" field in this mutation.
+func (m *ConnectorMutation) AppendedGrantTypes() ([]string, bool) {
+	if len(m.appendgrant_types) == 0 {
+		return nil, false
+	}
+	return m.appendgrant_types, true
+}
+
+// ClearGrantTypes clears the value of the "grant_types" field.
+func (m *ConnectorMutation) ClearGrantTypes() {
+	m.grant_types = nil
+	m.appendgrant_types = nil
+	m.clearedFields[connector.FieldGrantTypes] = struct{}{}
+}
+
+// GrantTypesCleared returns if the "grant_types" field was cleared in this mutation.
+func (m *ConnectorMutation) GrantTypesCleared() bool {
+	_, ok := m.clearedFields[connector.FieldGrantTypes]
+	return ok
+}
+
+// ResetGrantTypes resets all changes to the "grant_types" field.
+func (m *ConnectorMutation) ResetGrantTypes() {
+	m.grant_types = nil
+	m.appendgrant_types = nil
+	delete(m.clearedFields, connector.FieldGrantTypes)
+}
+
 // Where appends a list predicates to the ConnectorMutation builder.
 func (m *ConnectorMutation) Where(ps ...predicate.Connector) {
 	m.predicates = append(m.predicates, ps...)
@@ -3015,7 +3082,7 @@ func (m *ConnectorMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *ConnectorMutation) Fields() []string {
-	fields := make([]string, 0, 4)
+	fields := make([]string, 0, 5)
 	if m._type != nil {
 		fields = append(fields, connector.FieldType)
 	}
@@ -3027,6 +3094,9 @@ func (m *ConnectorMutation) Fields() []string {
 	}
 	if m._config != nil {
 		fields = append(fields, connector.FieldConfig)
+	}
+	if m.grant_types != nil {
+		fields = append(fields, connector.FieldGrantTypes)
 	}
 	return fields
 }
@@ -3044,6 +3114,8 @@ func (m *ConnectorMutation) Field(name string) (ent.Value, bool) {
 		return m.ResourceVersion()
 	case connector.FieldConfig:
 		return m.Config()
+	case connector.FieldGrantTypes:
+		return m.GrantTypes()
 	}
 	return nil, false
 }
@@ -3061,6 +3133,8 @@ func (m *ConnectorMutation) OldField(ctx context.Context, name string) (ent.Valu
 		return m.OldResourceVersion(ctx)
 	case connector.FieldConfig:
 		return m.OldConfig(ctx)
+	case connector.FieldGrantTypes:
+		return m.OldGrantTypes(ctx)
 	}
 	return nil, fmt.Errorf("unknown Connector field %s", name)
 }
@@ -3098,6 +3172,13 @@ func (m *ConnectorMutation) SetField(name string, value ent.Value) error {
 		}
 		m.SetConfig(v)
 		return nil
+	case connector.FieldGrantTypes:
+		v, ok := value.([]string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetGrantTypes(v)
+		return nil
 	}
 	return fmt.Errorf("unknown Connector field %s", name)
 }
@@ -3127,7 +3208,11 @@ func (m *ConnectorMutation) AddField(name string, value ent.Value) error {
 // ClearedFields returns all nullable fields that were cleared during this
 // mutation.
 func (m *ConnectorMutation) ClearedFields() []string {
-	return nil
+	var fields []string
+	if m.FieldCleared(connector.FieldGrantTypes) {
+		fields = append(fields, connector.FieldGrantTypes)
+	}
+	return fields
 }
 
 // FieldCleared returns a boolean indicating if a field with the given name was
@@ -3140,6 +3225,11 @@ func (m *ConnectorMutation) FieldCleared(name string) bool {
 // ClearField clears the value of the field with the given name. It returns an
 // error if the field is not defined in the schema.
 func (m *ConnectorMutation) ClearField(name string) error {
+	switch name {
+	case connector.FieldGrantTypes:
+		m.ClearGrantTypes()
+		return nil
+	}
 	return fmt.Errorf("unknown Connector nullable field %s", name)
 }
 
@@ -3158,6 +3248,9 @@ func (m *ConnectorMutation) ResetField(name string) error {
 		return nil
 	case connector.FieldConfig:
 		m.ResetConfig()
+		return nil
+	case connector.FieldGrantTypes:
+		m.ResetGrantTypes()
 		return nil
 	}
 	return fmt.Errorf("unknown Connector field %s", name)
@@ -5121,21 +5214,23 @@ func (m *KeysMutation) ResetEdge(name string) error {
 // OAuth2ClientMutation represents an operation that mutates the OAuth2Client nodes in the graph.
 type OAuth2ClientMutation struct {
 	config
-	op                  Op
-	typ                 string
-	id                  *string
-	secret              *string
-	redirect_uris       *[]string
-	appendredirect_uris []string
-	trusted_peers       *[]string
-	appendtrusted_peers []string
-	public              *bool
-	name                *string
-	logo_url            *string
-	clearedFields       map[string]struct{}
-	done                bool
-	oldValue            func(context.Context) (*OAuth2Client, error)
-	predicates          []predicate.OAuth2Client
+	op                       Op
+	typ                      string
+	id                       *string
+	secret                   *string
+	redirect_uris            *[]string
+	appendredirect_uris      []string
+	trusted_peers            *[]string
+	appendtrusted_peers      []string
+	public                   *bool
+	name                     *string
+	logo_url                 *string
+	allowed_connectors       *[]string
+	appendallowed_connectors []string
+	clearedFields            map[string]struct{}
+	done                     bool
+	oldValue                 func(context.Context) (*OAuth2Client, error)
+	predicates               []predicate.OAuth2Client
 }
 
 var _ ent.Mutation = (*OAuth2ClientMutation)(nil)
@@ -5516,6 +5611,71 @@ func (m *OAuth2ClientMutation) ResetLogoURL() {
 	m.logo_url = nil
 }
 
+// SetAllowedConnectors sets the "allowed_connectors" field.
+func (m *OAuth2ClientMutation) SetAllowedConnectors(s []string) {
+	m.allowed_connectors = &s
+	m.appendallowed_connectors = nil
+}
+
+// AllowedConnectors returns the value of the "allowed_connectors" field in the mutation.
+func (m *OAuth2ClientMutation) AllowedConnectors() (r []string, exists bool) {
+	v := m.allowed_connectors
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldAllowedConnectors returns the old "allowed_connectors" field's value of the OAuth2Client entity.
+// If the OAuth2Client object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *OAuth2ClientMutation) OldAllowedConnectors(ctx context.Context) (v []string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldAllowedConnectors is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldAllowedConnectors requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldAllowedConnectors: %w", err)
+	}
+	return oldValue.AllowedConnectors, nil
+}
+
+// AppendAllowedConnectors adds s to the "allowed_connectors" field.
+func (m *OAuth2ClientMutation) AppendAllowedConnectors(s []string) {
+	m.appendallowed_connectors = append(m.appendallowed_connectors, s...)
+}
+
+// AppendedAllowedConnectors returns the list of values that were appended to the "allowed_connectors" field in this mutation.
+func (m *OAuth2ClientMutation) AppendedAllowedConnectors() ([]string, bool) {
+	if len(m.appendallowed_connectors) == 0 {
+		return nil, false
+	}
+	return m.appendallowed_connectors, true
+}
+
+// ClearAllowedConnectors clears the value of the "allowed_connectors" field.
+func (m *OAuth2ClientMutation) ClearAllowedConnectors() {
+	m.allowed_connectors = nil
+	m.appendallowed_connectors = nil
+	m.clearedFields[oauth2client.FieldAllowedConnectors] = struct{}{}
+}
+
+// AllowedConnectorsCleared returns if the "allowed_connectors" field was cleared in this mutation.
+func (m *OAuth2ClientMutation) AllowedConnectorsCleared() bool {
+	_, ok := m.clearedFields[oauth2client.FieldAllowedConnectors]
+	return ok
+}
+
+// ResetAllowedConnectors resets all changes to the "allowed_connectors" field.
+func (m *OAuth2ClientMutation) ResetAllowedConnectors() {
+	m.allowed_connectors = nil
+	m.appendallowed_connectors = nil
+	delete(m.clearedFields, oauth2client.FieldAllowedConnectors)
+}
+
 // Where appends a list predicates to the OAuth2ClientMutation builder.
 func (m *OAuth2ClientMutation) Where(ps ...predicate.OAuth2Client) {
 	m.predicates = append(m.predicates, ps...)
@@ -5550,7 +5710,7 @@ func (m *OAuth2ClientMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *OAuth2ClientMutation) Fields() []string {
-	fields := make([]string, 0, 6)
+	fields := make([]string, 0, 7)
 	if m.secret != nil {
 		fields = append(fields, oauth2client.FieldSecret)
 	}
@@ -5568,6 +5728,9 @@ func (m *OAuth2ClientMutation) Fields() []string {
 	}
 	if m.logo_url != nil {
 		fields = append(fields, oauth2client.FieldLogoURL)
+	}
+	if m.allowed_connectors != nil {
+		fields = append(fields, oauth2client.FieldAllowedConnectors)
 	}
 	return fields
 }
@@ -5589,6 +5752,8 @@ func (m *OAuth2ClientMutation) Field(name string) (ent.Value, bool) {
 		return m.Name()
 	case oauth2client.FieldLogoURL:
 		return m.LogoURL()
+	case oauth2client.FieldAllowedConnectors:
+		return m.AllowedConnectors()
 	}
 	return nil, false
 }
@@ -5610,6 +5775,8 @@ func (m *OAuth2ClientMutation) OldField(ctx context.Context, name string) (ent.V
 		return m.OldName(ctx)
 	case oauth2client.FieldLogoURL:
 		return m.OldLogoURL(ctx)
+	case oauth2client.FieldAllowedConnectors:
+		return m.OldAllowedConnectors(ctx)
 	}
 	return nil, fmt.Errorf("unknown OAuth2Client field %s", name)
 }
@@ -5661,6 +5828,13 @@ func (m *OAuth2ClientMutation) SetField(name string, value ent.Value) error {
 		}
 		m.SetLogoURL(v)
 		return nil
+	case oauth2client.FieldAllowedConnectors:
+		v, ok := value.([]string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetAllowedConnectors(v)
+		return nil
 	}
 	return fmt.Errorf("unknown OAuth2Client field %s", name)
 }
@@ -5697,6 +5871,9 @@ func (m *OAuth2ClientMutation) ClearedFields() []string {
 	if m.FieldCleared(oauth2client.FieldTrustedPeers) {
 		fields = append(fields, oauth2client.FieldTrustedPeers)
 	}
+	if m.FieldCleared(oauth2client.FieldAllowedConnectors) {
+		fields = append(fields, oauth2client.FieldAllowedConnectors)
+	}
 	return fields
 }
 
@@ -5716,6 +5893,9 @@ func (m *OAuth2ClientMutation) ClearField(name string) error {
 		return nil
 	case oauth2client.FieldTrustedPeers:
 		m.ClearTrustedPeers()
+		return nil
+	case oauth2client.FieldAllowedConnectors:
+		m.ClearAllowedConnectors()
 		return nil
 	}
 	return fmt.Errorf("unknown OAuth2Client nullable field %s", name)
@@ -5742,6 +5922,9 @@ func (m *OAuth2ClientMutation) ResetField(name string) error {
 		return nil
 	case oauth2client.FieldLogoURL:
 		m.ResetLogoURL()
+		return nil
+	case oauth2client.FieldAllowedConnectors:
+		m.ResetAllowedConnectors()
 		return nil
 	}
 	return fmt.Errorf("unknown OAuth2Client field %s", name)
@@ -6314,17 +6497,22 @@ func (m *OfflineSessionMutation) ResetEdge(name string) error {
 // PasswordMutation represents an operation that mutates the Password nodes in the graph.
 type PasswordMutation struct {
 	config
-	op            Op
-	typ           string
-	id            *int
-	email         *string
-	hash          *[]byte
-	username      *string
-	user_id       *string
-	clearedFields map[string]struct{}
-	done          bool
-	oldValue      func(context.Context) (*Password, error)
-	predicates    []predicate.Password
+	op                 Op
+	typ                string
+	id                 *int
+	email              *string
+	hash               *[]byte
+	username           *string
+	name               *string
+	preferred_username *string
+	email_verified     *bool
+	user_id            *string
+	groups             *[]string
+	appendgroups       []string
+	clearedFields      map[string]struct{}
+	done               bool
+	oldValue           func(context.Context) (*Password, error)
+	predicates         []predicate.Password
 }
 
 var _ ent.Mutation = (*PasswordMutation)(nil)
@@ -6533,6 +6721,127 @@ func (m *PasswordMutation) ResetUsername() {
 	m.username = nil
 }
 
+// SetName sets the "name" field.
+func (m *PasswordMutation) SetName(s string) {
+	m.name = &s
+}
+
+// Name returns the value of the "name" field in the mutation.
+func (m *PasswordMutation) Name() (r string, exists bool) {
+	v := m.name
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldName returns the old "name" field's value of the Password entity.
+// If the Password object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *PasswordMutation) OldName(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldName is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldName requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldName: %w", err)
+	}
+	return oldValue.Name, nil
+}
+
+// ResetName resets all changes to the "name" field.
+func (m *PasswordMutation) ResetName() {
+	m.name = nil
+}
+
+// SetPreferredUsername sets the "preferred_username" field.
+func (m *PasswordMutation) SetPreferredUsername(s string) {
+	m.preferred_username = &s
+}
+
+// PreferredUsername returns the value of the "preferred_username" field in the mutation.
+func (m *PasswordMutation) PreferredUsername() (r string, exists bool) {
+	v := m.preferred_username
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldPreferredUsername returns the old "preferred_username" field's value of the Password entity.
+// If the Password object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *PasswordMutation) OldPreferredUsername(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldPreferredUsername is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldPreferredUsername requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldPreferredUsername: %w", err)
+	}
+	return oldValue.PreferredUsername, nil
+}
+
+// ResetPreferredUsername resets all changes to the "preferred_username" field.
+func (m *PasswordMutation) ResetPreferredUsername() {
+	m.preferred_username = nil
+}
+
+// SetEmailVerified sets the "email_verified" field.
+func (m *PasswordMutation) SetEmailVerified(b bool) {
+	m.email_verified = &b
+}
+
+// EmailVerified returns the value of the "email_verified" field in the mutation.
+func (m *PasswordMutation) EmailVerified() (r bool, exists bool) {
+	v := m.email_verified
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldEmailVerified returns the old "email_verified" field's value of the Password entity.
+// If the Password object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *PasswordMutation) OldEmailVerified(ctx context.Context) (v *bool, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldEmailVerified is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldEmailVerified requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldEmailVerified: %w", err)
+	}
+	return oldValue.EmailVerified, nil
+}
+
+// ClearEmailVerified clears the value of the "email_verified" field.
+func (m *PasswordMutation) ClearEmailVerified() {
+	m.email_verified = nil
+	m.clearedFields[password.FieldEmailVerified] = struct{}{}
+}
+
+// EmailVerifiedCleared returns if the "email_verified" field was cleared in this mutation.
+func (m *PasswordMutation) EmailVerifiedCleared() bool {
+	_, ok := m.clearedFields[password.FieldEmailVerified]
+	return ok
+}
+
+// ResetEmailVerified resets all changes to the "email_verified" field.
+func (m *PasswordMutation) ResetEmailVerified() {
+	m.email_verified = nil
+	delete(m.clearedFields, password.FieldEmailVerified)
+}
+
 // SetUserID sets the "user_id" field.
 func (m *PasswordMutation) SetUserID(s string) {
 	m.user_id = &s
@@ -6569,6 +6878,71 @@ func (m *PasswordMutation) ResetUserID() {
 	m.user_id = nil
 }
 
+// SetGroups sets the "groups" field.
+func (m *PasswordMutation) SetGroups(s []string) {
+	m.groups = &s
+	m.appendgroups = nil
+}
+
+// Groups returns the value of the "groups" field in the mutation.
+func (m *PasswordMutation) Groups() (r []string, exists bool) {
+	v := m.groups
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldGroups returns the old "groups" field's value of the Password entity.
+// If the Password object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *PasswordMutation) OldGroups(ctx context.Context) (v []string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldGroups is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldGroups requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldGroups: %w", err)
+	}
+	return oldValue.Groups, nil
+}
+
+// AppendGroups adds s to the "groups" field.
+func (m *PasswordMutation) AppendGroups(s []string) {
+	m.appendgroups = append(m.appendgroups, s...)
+}
+
+// AppendedGroups returns the list of values that were appended to the "groups" field in this mutation.
+func (m *PasswordMutation) AppendedGroups() ([]string, bool) {
+	if len(m.appendgroups) == 0 {
+		return nil, false
+	}
+	return m.appendgroups, true
+}
+
+// ClearGroups clears the value of the "groups" field.
+func (m *PasswordMutation) ClearGroups() {
+	m.groups = nil
+	m.appendgroups = nil
+	m.clearedFields[password.FieldGroups] = struct{}{}
+}
+
+// GroupsCleared returns if the "groups" field was cleared in this mutation.
+func (m *PasswordMutation) GroupsCleared() bool {
+	_, ok := m.clearedFields[password.FieldGroups]
+	return ok
+}
+
+// ResetGroups resets all changes to the "groups" field.
+func (m *PasswordMutation) ResetGroups() {
+	m.groups = nil
+	m.appendgroups = nil
+	delete(m.clearedFields, password.FieldGroups)
+}
+
 // Where appends a list predicates to the PasswordMutation builder.
 func (m *PasswordMutation) Where(ps ...predicate.Password) {
 	m.predicates = append(m.predicates, ps...)
@@ -6603,7 +6977,7 @@ func (m *PasswordMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *PasswordMutation) Fields() []string {
-	fields := make([]string, 0, 4)
+	fields := make([]string, 0, 8)
 	if m.email != nil {
 		fields = append(fields, password.FieldEmail)
 	}
@@ -6613,8 +6987,20 @@ func (m *PasswordMutation) Fields() []string {
 	if m.username != nil {
 		fields = append(fields, password.FieldUsername)
 	}
+	if m.name != nil {
+		fields = append(fields, password.FieldName)
+	}
+	if m.preferred_username != nil {
+		fields = append(fields, password.FieldPreferredUsername)
+	}
+	if m.email_verified != nil {
+		fields = append(fields, password.FieldEmailVerified)
+	}
 	if m.user_id != nil {
 		fields = append(fields, password.FieldUserID)
+	}
+	if m.groups != nil {
+		fields = append(fields, password.FieldGroups)
 	}
 	return fields
 }
@@ -6630,8 +7016,16 @@ func (m *PasswordMutation) Field(name string) (ent.Value, bool) {
 		return m.Hash()
 	case password.FieldUsername:
 		return m.Username()
+	case password.FieldName:
+		return m.Name()
+	case password.FieldPreferredUsername:
+		return m.PreferredUsername()
+	case password.FieldEmailVerified:
+		return m.EmailVerified()
 	case password.FieldUserID:
 		return m.UserID()
+	case password.FieldGroups:
+		return m.Groups()
 	}
 	return nil, false
 }
@@ -6647,8 +7041,16 @@ func (m *PasswordMutation) OldField(ctx context.Context, name string) (ent.Value
 		return m.OldHash(ctx)
 	case password.FieldUsername:
 		return m.OldUsername(ctx)
+	case password.FieldName:
+		return m.OldName(ctx)
+	case password.FieldPreferredUsername:
+		return m.OldPreferredUsername(ctx)
+	case password.FieldEmailVerified:
+		return m.OldEmailVerified(ctx)
 	case password.FieldUserID:
 		return m.OldUserID(ctx)
+	case password.FieldGroups:
+		return m.OldGroups(ctx)
 	}
 	return nil, fmt.Errorf("unknown Password field %s", name)
 }
@@ -6679,12 +7081,40 @@ func (m *PasswordMutation) SetField(name string, value ent.Value) error {
 		}
 		m.SetUsername(v)
 		return nil
+	case password.FieldName:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetName(v)
+		return nil
+	case password.FieldPreferredUsername:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetPreferredUsername(v)
+		return nil
+	case password.FieldEmailVerified:
+		v, ok := value.(bool)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetEmailVerified(v)
+		return nil
 	case password.FieldUserID:
 		v, ok := value.(string)
 		if !ok {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.SetUserID(v)
+		return nil
+	case password.FieldGroups:
+		v, ok := value.([]string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetGroups(v)
 		return nil
 	}
 	return fmt.Errorf("unknown Password field %s", name)
@@ -6715,7 +7145,14 @@ func (m *PasswordMutation) AddField(name string, value ent.Value) error {
 // ClearedFields returns all nullable fields that were cleared during this
 // mutation.
 func (m *PasswordMutation) ClearedFields() []string {
-	return nil
+	var fields []string
+	if m.FieldCleared(password.FieldEmailVerified) {
+		fields = append(fields, password.FieldEmailVerified)
+	}
+	if m.FieldCleared(password.FieldGroups) {
+		fields = append(fields, password.FieldGroups)
+	}
+	return fields
 }
 
 // FieldCleared returns a boolean indicating if a field with the given name was
@@ -6728,6 +7165,14 @@ func (m *PasswordMutation) FieldCleared(name string) bool {
 // ClearField clears the value of the field with the given name. It returns an
 // error if the field is not defined in the schema.
 func (m *PasswordMutation) ClearField(name string) error {
+	switch name {
+	case password.FieldEmailVerified:
+		m.ClearEmailVerified()
+		return nil
+	case password.FieldGroups:
+		m.ClearGroups()
+		return nil
+	}
 	return fmt.Errorf("unknown Password nullable field %s", name)
 }
 
@@ -6744,8 +7189,20 @@ func (m *PasswordMutation) ResetField(name string) error {
 	case password.FieldUsername:
 		m.ResetUsername()
 		return nil
+	case password.FieldName:
+		m.ResetName()
+		return nil
+	case password.FieldPreferredUsername:
+		m.ResetPreferredUsername()
+		return nil
+	case password.FieldEmailVerified:
+		m.ResetEmailVerified()
+		return nil
 	case password.FieldUserID:
 		m.ResetUserID()
+		return nil
+	case password.FieldGroups:
+		m.ResetGroups()
 		return nil
 	}
 	return fmt.Errorf("unknown Password field %s", name)

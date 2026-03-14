@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -15,7 +16,6 @@ import (
 	entSQL "entgo.io/ent/dialect/sql"
 	"github.com/go-sql-driver/mysql" // Register mysql driver.
 
-	"github.com/dexidp/dex/pkg/log"
 	"github.com/dexidp/dex/storage"
 	"github.com/dexidp/dex/storage/ent/client"
 	"github.com/dexidp/dex/storage/ent/db"
@@ -39,7 +39,7 @@ type MySQL struct {
 }
 
 // Open always returns a new in sqlite3 storage.
-func (m *MySQL) Open(logger log.Logger) (storage.Storage, error) {
+func (m *MySQL) Open(logger *slog.Logger) (storage.Storage, error) {
 	logger.Debug("experimental ent-based storage driver is enabled")
 	drv, err := m.driver()
 	if err != nil {
@@ -81,7 +81,7 @@ func (m *MySQL) driver() (*entSQL.Driver, error) {
 	}
 
 	if m.MaxIdleConns == 0 {
-		/* Override default behaviour to fix https://github.com/dexidp/dex/issues/1608 */
+		/* Override default behavior to fix https://github.com/dexidp/dex/issues/1608 */
 		drv.DB().SetMaxIdleConns(0)
 	} else {
 		drv.DB().SetMaxIdleConns(m.MaxIdleConns)

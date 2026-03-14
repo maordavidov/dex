@@ -76,22 +76,24 @@ func toStorageAuthCode(a *db.AuthCode) storage.AuthCode {
 
 func toStorageClient(c *db.OAuth2Client) storage.Client {
 	return storage.Client{
-		ID:           c.ID,
-		Secret:       c.Secret,
-		RedirectURIs: c.RedirectUris,
-		TrustedPeers: c.TrustedPeers,
-		Public:       c.Public,
-		Name:         c.Name,
-		LogoURL:      c.LogoURL,
+		ID:                c.ID,
+		Secret:            c.Secret,
+		RedirectURIs:      c.RedirectUris,
+		TrustedPeers:      c.TrustedPeers,
+		Public:            c.Public,
+		Name:              c.Name,
+		LogoURL:           c.LogoURL,
+		AllowedConnectors: c.AllowedConnectors,
 	}
 }
 
 func toStorageConnector(c *db.Connector) storage.Connector {
 	return storage.Connector{
-		ID:     c.ID,
-		Type:   c.Type,
-		Name:   c.Name,
-		Config: c.Config,
+		ID:         c.ID,
+		Type:       c.Type,
+		Name:       c.Name,
+		Config:     c.Config,
+		GrantTypes: c.GrantTypes,
 	}
 }
 
@@ -139,10 +141,14 @@ func toStorageRefreshToken(r *db.RefreshToken) storage.RefreshToken {
 
 func toStoragePassword(p *db.Password) storage.Password {
 	return storage.Password{
-		Email:    p.Email,
-		Hash:     p.Hash,
-		Username: p.Username,
-		UserID:   p.UserID,
+		Email:             p.Email,
+		Hash:              p.Hash,
+		Username:          p.Username,
+		Name:              p.Name,
+		PreferredUsername: p.PreferredUsername,
+		EmailVerified:     p.EmailVerified,
+		UserID:            p.UserID,
+		Groups:            p.Groups,
 	}
 }
 

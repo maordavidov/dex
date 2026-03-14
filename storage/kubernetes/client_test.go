@@ -3,6 +3,7 @@ package kubernetes
 import (
 	"hash"
 	"hash/fnv"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -10,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/dexidp/dex/storage/kubernetes/k8sapi"
@@ -52,11 +53,7 @@ func TestOfflineTokenName(t *testing.T) {
 }
 
 func TestInClusterTransport(t *testing.T) {
-	logger := &logrus.Logger{
-		Out:       os.Stderr,
-		Formatter: &logrus.TextFormatter{DisableColors: true},
-		Level:     logrus.DebugLevel,
-	}
+	logger := slog.New(slog.DiscardHandler)
 
 	user := k8sapi.AuthInfo{Token: "abc"}
 	cli, err := newClient(
@@ -65,6 +62,7 @@ func TestInClusterTransport(t *testing.T) {
 		"test",
 		logger,
 		true,
+		"",
 	)
 	require.NoError(t, err)
 
@@ -216,6 +214,63 @@ func TestGetClusterConfigNamespace(t *testing.T) {
 				require.NoError(t, err)
 			}
 			require.Equal(t, namespace, tc.expectedNamespace)
+		})
+	}
+}
+
+func TestGetInClusterConnectOptions(t *testing.T) {
+	type testCase struct {
+		name        string
+		host        string
+		port        string
+		expectedURL string
+		expectError bool
+	}
+
+	testCases := []testCase{
+		{
+			name:        "valid IPv4",
+			host:        "10.1.1.1",
+			port:        "443",
+			expectedURL: "https://10.1.1.1:443",
+		},
+		{
+			name:        "valid IPv6",
+			host:        "fd00::1",
+			port:        "8443",
+			expectedURL: "https://[fd00::1]:8443",
+		},
+		{
+			name:        "valid DNS name",
+			host:        "kubernetes.default.svc",
+			port:        "443",
+			expectedURL: "https://kubernetes.default.svc:443",
+		},
+		{
+			name:        "empty host",
+			host:        "",
+			port:        "443",
+			expectError: true,
+		},
+		{
+			name:        "empty port",
+			host:        "127.0.0.1",
+			port:        "",
+			expectError: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cluster, err := getInClusterConnectOptions(tc.host, tc.port)
+
+			if tc.expectError {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.expectedURL, cluster.Server)
+			assert.Equal(t, "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt", cluster.CertificateAuthority)
 		})
 	}
 }

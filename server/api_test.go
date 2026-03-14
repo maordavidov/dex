@@ -1,18 +1,17 @@
 package server
 
 import (
-	"context"
+	"log/slog"
 	"net"
-	"os"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/dexidp/dex/api/v2"
-	"github.com/dexidp/dex/pkg/log"
 	"github.com/dexidp/dex/server/internal"
 	"github.com/dexidp/dex/storage"
 	"github.com/dexidp/dex/storage/memory"
@@ -29,20 +28,24 @@ type apiClient struct {
 	Close func()
 }
 
+func newLogger(t *testing.T) *slog.Logger {
+	return slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
 // newAPI constructs a gRCP client connected to a backing server.
-func newAPI(s storage.Storage, logger log.Logger, t *testing.T) *apiClient {
+func newAPI(t *testing.T, s storage.Storage, logger *slog.Logger) *apiClient {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	serv := grpc.NewServer()
-	api.RegisterDexServer(serv, NewAPI(s, logger, "test"))
+	api.RegisterDexServer(serv, NewAPI(s, logger, "test", nil))
 	go serv.Serve(l)
 
-	// Dial will retry automatically if the serv.Serve() goroutine
+	// NewClient will retry automatically if the serv.Serve() goroutine
 	// hasn't started yet.
-	conn, err := grpc.Dial(l.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(l.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,17 +62,14 @@ func newAPI(s storage.Storage, logger log.Logger, t *testing.T) *apiClient {
 
 // Attempts to create, update and delete a test Password
 func TestPassword(t *testing.T) {
-	logger := &logrus.Logger{
-		Out:       os.Stderr,
-		Formatter: &logrus.TextFormatter{DisableColors: true},
-		Level:     logrus.DebugLevel,
-	}
-
+	logger := newLogger(t)
 	s := memory.New(logger)
-	client := newAPI(s, logger, t)
+
+	client := newAPI(t, s, logger)
 	defer client.Close()
 
-	ctx := context.Background()
+	ctx := t.Context()
+
 	email := "test@example.com"
 	p := api.Password{
 		Email: email,
@@ -152,7 +152,7 @@ func TestPassword(t *testing.T) {
 		t.Fatalf("Unable to update password: %v", err)
 	}
 
-	pass, err := s.GetPassword(updateReq.Email)
+	pass, err := s.GetPassword(ctx, updateReq.Email)
 	if err != nil {
 		t.Fatalf("Unable to retrieve password: %v", err)
 	}
@@ -172,14 +172,10 @@ func TestPassword(t *testing.T) {
 
 // Ensures checkCost returns expected values
 func TestCheckCost(t *testing.T) {
-	logger := &logrus.Logger{
-		Out:       os.Stderr,
-		Formatter: &logrus.TextFormatter{DisableColors: true},
-		Level:     logrus.DebugLevel,
-	}
-
+	logger := newLogger(t)
 	s := memory.New(logger)
-	client := newAPI(s, logger, t)
+
+	client := newAPI(t, s, logger)
 	defer client.Close()
 
 	tests := []struct {
@@ -229,17 +225,13 @@ func TestCheckCost(t *testing.T) {
 
 // Attempts to list and revoke an existing refresh token.
 func TestRefreshToken(t *testing.T) {
-	logger := &logrus.Logger{
-		Out:       os.Stderr,
-		Formatter: &logrus.TextFormatter{DisableColors: true},
-		Level:     logrus.DebugLevel,
-	}
-
+	logger := newLogger(t)
 	s := memory.New(logger)
-	client := newAPI(s, logger, t)
+
+	client := newAPI(t, s, logger)
 	defer client.Close()
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Creating a storage with an existing refresh token and offline session for the user.
 	id := storage.NewID()
@@ -342,16 +334,13 @@ func TestRefreshToken(t *testing.T) {
 }
 
 func TestUpdateClient(t *testing.T) {
-	logger := &logrus.Logger{
-		Out:       os.Stderr,
-		Formatter: &logrus.TextFormatter{DisableColors: true},
-		Level:     logrus.DebugLevel,
-	}
-
+	logger := newLogger(t)
 	s := memory.New(logger)
-	client := newAPI(s, logger, t)
+
+	client := newAPI(t, s, logger)
 	defer client.Close()
-	ctx := context.Background()
+
+	ctx := t.Context()
 
 	createClient := func(t *testing.T, clientId string) {
 		resp, err := client.CreateClient(ctx, &api.CreateClientReq{
@@ -464,7 +453,7 @@ func TestUpdateClient(t *testing.T) {
 					t.Errorf("expected in response NotFound: %t", tc.want.NotFound)
 				}
 
-				client, err := s.GetClient(tc.req.Id)
+				client, err := s.GetClient(ctx, tc.req.Id)
 				if err != nil {
 					t.Errorf("no client found in the storage: %v", err)
 				}
@@ -479,13 +468,13 @@ func TestUpdateClient(t *testing.T) {
 					t.Errorf("expected stored client with LogoURL: %s, found %s", tc.req.LogoUrl, client.LogoURL)
 				}
 				for _, redirectURI := range tc.req.RedirectUris {
-					found := find(redirectURI, client.RedirectURIs)
+					found := slices.Contains(client.RedirectURIs, redirectURI)
 					if !found {
 						t.Errorf("expected redirect URI: %s", redirectURI)
 					}
 				}
 				for _, peer := range tc.req.TrustedPeers {
-					found := find(peer, client.TrustedPeers)
+					found := slices.Contains(client.TrustedPeers, peer)
 					if !found {
 						t.Errorf("expected trusted peer: %s", peer)
 					}
@@ -499,11 +488,439 @@ func TestUpdateClient(t *testing.T) {
 	}
 }
 
-func find(item string, items []string) bool {
-	for _, i := range items {
-		if item == i {
-			return true
+func TestCreateConnector(t *testing.T) {
+	t.Setenv("DEX_API_CONNECTORS_CRUD", "true")
+
+	logger := newLogger(t)
+	s := memory.New(logger)
+
+	client := newAPI(t, s, logger)
+	defer client.Close()
+
+	ctx := t.Context()
+
+	connectorID := "connector123"
+	connectorName := "TestConnector"
+	connectorType := "TestType"
+	connectorConfig := []byte(`{"key": "value"}`)
+
+	createReq := api.CreateConnectorReq{
+		Connector: &api.Connector{
+			Id:     connectorID,
+			Name:   connectorName,
+			Type:   connectorType,
+			Config: connectorConfig,
+		},
+	}
+
+	// Test valid connector creation
+	if resp, err := client.CreateConnector(ctx, &createReq); err != nil || resp.AlreadyExists {
+		if err != nil {
+			t.Fatalf("Unable to create connector: %v", err)
+		} else if resp.AlreadyExists {
+			t.Fatalf("Unable to create connector since %s already exists", connectorID)
+		}
+		t.Fatalf("Unable to create connector: %v", err)
+	}
+
+	// Test creating the same connector again (expecting failure)
+	if resp, _ := client.CreateConnector(ctx, &createReq); !resp.AlreadyExists {
+		t.Fatalf("Created connector %s twice", connectorID)
+	}
+
+	createReq.Connector.Config = []byte("invalid_json")
+
+	// Test invalid JSON config
+	if _, err := client.CreateConnector(ctx, &createReq); err == nil {
+		t.Fatal("Expected an error for invalid JSON config, but none occurred")
+	} else if !strings.Contains(err.Error(), "invalid config supplied") {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+}
+
+func TestUpdateConnector(t *testing.T) {
+	t.Setenv("DEX_API_CONNECTORS_CRUD", "true")
+
+	logger := newLogger(t)
+	s := memory.New(logger)
+
+	client := newAPI(t, s, logger)
+	defer client.Close()
+
+	ctx := t.Context()
+
+	connectorID := "connector123"
+	newConnectorName := "UpdatedConnector"
+	newConnectorType := "UpdatedType"
+	newConnectorConfig := []byte(`{"updated_key": "updated_value"}`)
+
+	// Create a connector for testing
+	createReq := api.CreateConnectorReq{
+		Connector: &api.Connector{
+			Id:     connectorID,
+			Name:   "TestConnector",
+			Type:   "TestType",
+			Config: []byte(`{"key": "value"}`),
+		},
+	}
+	client.CreateConnector(ctx, &createReq)
+
+	updateReq := api.UpdateConnectorReq{
+		Id:        connectorID,
+		NewName:   newConnectorName,
+		NewType:   newConnectorType,
+		NewConfig: newConnectorConfig,
+	}
+
+	// Test valid connector update
+	if _, err := client.UpdateConnector(ctx, &updateReq); err != nil {
+		t.Fatalf("Unable to update connector: %v", err)
+	}
+
+	resp, err := client.ListConnectors(ctx, &api.ListConnectorReq{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	for _, connector := range resp.Connectors {
+		if connector.Id == connectorID {
+			if connector.Name != newConnectorName {
+				t.Fatal("connector name should have been updated")
+			}
+			if string(connector.Config) != string(newConnectorConfig) {
+				t.Fatal("connector config should have been updated")
+			}
+			if connector.Type != newConnectorType {
+				t.Fatal("connector type should have been updated")
+			}
 		}
 	}
-	return false
+
+	updateReq.NewConfig = []byte("invalid_json")
+
+	// Test invalid JSON config in update request
+	if _, err := client.UpdateConnector(ctx, &updateReq); err == nil {
+		t.Fatal("Expected an error for invalid JSON config in update, but none occurred")
+	} else if !strings.Contains(err.Error(), "invalid config supplied") {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+}
+
+func TestUpdateConnectorGrantTypes(t *testing.T) {
+	t.Setenv("DEX_API_CONNECTORS_CRUD", "true")
+
+	logger := newLogger(t)
+	s := memory.New(logger)
+
+	client := newAPI(t, s, logger)
+	defer client.Close()
+
+	ctx := t.Context()
+
+	connectorID := "connector-gt"
+
+	// Create a connector without grant types
+	createReq := api.CreateConnectorReq{
+		Connector: &api.Connector{
+			Id:     connectorID,
+			Name:   "TestConnector",
+			Type:   "TestType",
+			Config: []byte(`{"key": "value"}`),
+		},
+	}
+	_, err := client.CreateConnector(ctx, &createReq)
+	if err != nil {
+		t.Fatalf("failed to create connector: %v", err)
+	}
+
+	// Set grant types
+	_, err = client.UpdateConnector(ctx, &api.UpdateConnectorReq{
+		Id:            connectorID,
+		NewGrantTypes: &api.GrantTypes{GrantTypes: []string{"authorization_code", "refresh_token"}},
+	})
+	if err != nil {
+		t.Fatalf("failed to update connector grant types: %v", err)
+	}
+
+	resp, err := client.ListConnectors(ctx, &api.ListConnectorReq{})
+	if err != nil {
+		t.Fatalf("failed to list connectors: %v", err)
+	}
+	for _, c := range resp.Connectors {
+		if c.Id == connectorID {
+			if !slices.Equal(c.GrantTypes, []string{"authorization_code", "refresh_token"}) {
+				t.Fatalf("expected grant types [authorization_code refresh_token], got %v", c.GrantTypes)
+			}
+		}
+	}
+
+	// Clear grant types by passing empty GrantTypes message
+	_, err = client.UpdateConnector(ctx, &api.UpdateConnectorReq{
+		Id:            connectorID,
+		NewGrantTypes: &api.GrantTypes{},
+	})
+	if err != nil {
+		t.Fatalf("failed to clear connector grant types: %v", err)
+	}
+
+	resp, err = client.ListConnectors(ctx, &api.ListConnectorReq{})
+	if err != nil {
+		t.Fatalf("failed to list connectors: %v", err)
+	}
+	for _, c := range resp.Connectors {
+		if c.Id == connectorID {
+			if len(c.GrantTypes) != 0 {
+				t.Fatalf("expected empty grant types after clear, got %v", c.GrantTypes)
+			}
+		}
+	}
+
+	// Reject invalid grant type on update
+	_, err = client.UpdateConnector(ctx, &api.UpdateConnectorReq{
+		Id:            connectorID,
+		NewGrantTypes: &api.GrantTypes{GrantTypes: []string{"bogus"}},
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid grant type, got nil")
+	}
+	if !strings.Contains(err.Error(), `unknown grant type "bogus"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Reject invalid grant type on create
+	_, err = client.CreateConnector(ctx, &api.CreateConnectorReq{
+		Connector: &api.Connector{
+			Id:         "bad-gt",
+			Name:       "Bad",
+			Type:       "TestType",
+			Config:     []byte(`{}`),
+			GrantTypes: []string{"invalid_type"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid grant type on create, got nil")
+	}
+	if !strings.Contains(err.Error(), `unknown grant type "invalid_type"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDeleteConnector(t *testing.T) {
+	t.Setenv("DEX_API_CONNECTORS_CRUD", "true")
+
+	logger := newLogger(t)
+	s := memory.New(logger)
+
+	client := newAPI(t, s, logger)
+	defer client.Close()
+
+	ctx := t.Context()
+
+	connectorID := "connector123"
+
+	// Create a connector for testing
+	createReq := api.CreateConnectorReq{
+		Connector: &api.Connector{
+			Id:     connectorID,
+			Name:   "TestConnector",
+			Type:   "TestType",
+			Config: []byte(`{"key": "value"}`),
+		},
+	}
+	client.CreateConnector(ctx, &createReq)
+
+	deleteReq := api.DeleteConnectorReq{
+		Id: connectorID,
+	}
+
+	// Test valid connector deletion
+	if _, err := client.DeleteConnector(ctx, &deleteReq); err != nil {
+		t.Fatalf("Unable to delete connector: %v", err)
+	}
+
+	// Test non existent connector deletion
+	resp, err := client.DeleteConnector(ctx, &deleteReq)
+	if err != nil {
+		t.Fatalf("Unable to delete connector: %v", err)
+	}
+
+	if !resp.NotFound {
+		t.Fatal("Should return not found")
+	}
+}
+
+func TestListConnectors(t *testing.T) {
+	t.Setenv("DEX_API_CONNECTORS_CRUD", "true")
+
+	logger := newLogger(t)
+	s := memory.New(logger)
+
+	client := newAPI(t, s, logger)
+	defer client.Close()
+
+	ctx := t.Context()
+
+	// Create connectors for testing
+	createReq1 := api.CreateConnectorReq{
+		Connector: &api.Connector{
+			Id:     "connector1",
+			Name:   "Connector1",
+			Type:   "Type1",
+			Config: []byte(`{"key": "value1"}`),
+		},
+	}
+	client.CreateConnector(ctx, &createReq1)
+
+	createReq2 := api.CreateConnectorReq{
+		Connector: &api.Connector{
+			Id:     "connector2",
+			Name:   "Connector2",
+			Type:   "Type2",
+			Config: []byte(`{"key": "value2"}`),
+		},
+	}
+	client.CreateConnector(ctx, &createReq2)
+
+	listReq := api.ListConnectorReq{}
+
+	// Test listing connectors
+	if resp, err := client.ListConnectors(ctx, &listReq); err != nil {
+		t.Fatalf("Unable to list connectors: %v", err)
+	} else if len(resp.Connectors) != 2 { // Check the number of connectors in the response
+		t.Fatalf("Expected 2 connectors, found %d", len(resp.Connectors))
+	}
+}
+
+func TestMissingConnectorsCRUDFeatureFlag(t *testing.T) {
+	logger := newLogger(t)
+	s := memory.New(logger)
+
+	client := newAPI(t, s, logger)
+	defer client.Close()
+
+	ctx := t.Context()
+
+	// Create connectors for testing
+	createReq1 := api.CreateConnectorReq{
+		Connector: &api.Connector{
+			Id:     "connector1",
+			Name:   "Connector1",
+			Type:   "Type1",
+			Config: []byte(`{"key": "value1"}`),
+		},
+	}
+	client.CreateConnector(ctx, &createReq1)
+
+	createReq2 := api.CreateConnectorReq{
+		Connector: &api.Connector{
+			Id:     "connector2",
+			Name:   "Connector2",
+			Type:   "Type2",
+			Config: []byte(`{"key": "value2"}`),
+		},
+	}
+	client.CreateConnector(ctx, &createReq2)
+
+	listReq := api.ListConnectorReq{}
+
+	if _, err := client.ListConnectors(ctx, &listReq); err == nil {
+		t.Fatal("ListConnectors should have returned an error")
+	}
+}
+
+func TestListClients(t *testing.T) {
+	logger := newLogger(t)
+	s := memory.New(logger)
+
+	client := newAPI(t, s, logger)
+	defer client.Close()
+
+	ctx := t.Context()
+
+	// List Clients
+	listResp, err := client.ListClients(ctx, &api.ListClientReq{})
+	if err != nil {
+		t.Fatalf("Unable to list clients: %v", err)
+	}
+	if len(listResp.Clients) != 0 {
+		t.Fatalf("Expected 0 clients, got %d", len(listResp.Clients))
+	}
+
+	client1 := &api.Client{
+		Id:           "client1",
+		Secret:       "secret1",
+		RedirectUris: []string{"http://localhost:8080/callback"},
+		TrustedPeers: []string{"peer1"},
+		Public:       false,
+		Name:         "Test Client 1",
+		LogoUrl:      "http://example.com/logo1.png",
+	}
+
+	client2 := &api.Client{
+		Id:           "client2",
+		Secret:       "secret2",
+		RedirectUris: []string{"http://localhost:8081/callback"},
+		TrustedPeers: []string{"peer2"},
+		Public:       true,
+		Name:         "Test Client 2",
+		LogoUrl:      "http://example.com/logo2.png",
+	}
+
+	_, err = client.CreateClient(ctx, &api.CreateClientReq{Client: client1})
+	if err != nil {
+		t.Fatalf("Unable to create client1: %v", err)
+	}
+
+	_, err = client.CreateClient(ctx, &api.CreateClientReq{Client: client2})
+	if err != nil {
+		t.Fatalf("Unable to create client2: %v", err)
+	}
+
+	listResp, err = client.ListClients(ctx, &api.ListClientReq{})
+	if err != nil {
+		t.Fatalf("Unable to list clients: %v", err)
+	}
+
+	if len(listResp.Clients) != 2 {
+		t.Fatalf("Expected 2 clients, got %d", len(listResp.Clients))
+	}
+
+	clientMap := make(map[string]*api.ClientInfo)
+	for _, c := range listResp.Clients {
+		clientMap[c.Id] = c
+	}
+
+	if c1, exists := clientMap["client1"]; !exists {
+		t.Fatal("client1 not found in list")
+	} else {
+		if c1.Name != "Test Client 1" {
+			t.Errorf("Expected client1 name 'Test Client 1', got '%s'", c1.Name)
+		}
+		if len(c1.RedirectUris) != 1 || c1.RedirectUris[0] != "http://localhost:8080/callback" {
+			t.Errorf("Expected client1 redirect URIs ['http://localhost:8080/callback'], got %v", c1.RedirectUris)
+		}
+		if c1.Public != false {
+			t.Errorf("Expected client1 public false, got %v", c1.Public)
+		}
+		if c1.LogoUrl != "http://example.com/logo1.png" {
+			t.Errorf("Expected client1 logo URL 'http://example.com/logo1.png', got '%s'", c1.LogoUrl)
+		}
+	}
+
+	if c2, exists := clientMap["client2"]; !exists {
+		t.Fatal("client2 not found in list")
+	} else {
+		if c2.Name != "Test Client 2" {
+			t.Errorf("Expected client2 name 'Test Client 2', got '%s'", c2.Name)
+		}
+		if len(c2.RedirectUris) != 1 || c2.RedirectUris[0] != "http://localhost:8081/callback" {
+			t.Errorf("Expected client2 redirect URIs ['http://localhost:8081/callback'], got %v", c2.RedirectUris)
+		}
+		if c2.Public != true {
+			t.Errorf("Expected client2 public true, got %v", c2.Public)
+		}
+		if c2.LogoUrl != "http://example.com/logo2.png" {
+			t.Errorf("Expected client2 logo URL 'http://example.com/logo2.png', got '%s'", c2.LogoUrl)
+		}
+	}
 }

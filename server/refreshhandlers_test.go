@@ -2,8 +2,8 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,7 +18,7 @@ import (
 )
 
 func mockRefreshTokenTestStorage(t *testing.T, s storage.Storage, useObsolete bool) {
-	ctx := context.Background()
+	ctx := t.Context()
 	c := storage.Client{
 		ID:           "test",
 		Secret:       "barfoo",
@@ -153,11 +153,8 @@ func TestRefreshTokenExpirationScenarios(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(*testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
 			// Setup a dex server.
-			httpServer, s := newTestServer(ctx, t, func(c *Config) {
+			httpServer, s := newTestServer(t, func(c *Config) {
 				c.RefreshTokenPolicy = tc.policy
 				c.Now = func() time.Time { return t0 }
 			})
@@ -210,4 +207,26 @@ func TestRefreshTokenExpirationScenarios(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRefreshTokenPolicy(t *testing.T) {
+	lastTime := time.Now()
+	l := slog.New(slog.DiscardHandler)
+
+	r, err := NewRefreshTokenPolicy(l, true, "1m", "1m", "1m")
+	require.NoError(t, err)
+
+	t.Run("Allowed", func(t *testing.T) {
+		r.now = func() time.Time { return lastTime }
+		require.Equal(t, true, r.AllowedToReuse(lastTime))
+		require.Equal(t, false, r.ExpiredBecauseUnused(lastTime))
+		require.Equal(t, false, r.CompletelyExpired(lastTime))
+	})
+
+	t.Run("Expired", func(t *testing.T) {
+		r.now = func() time.Time { return lastTime.Add(2 * time.Minute) }
+		require.Equal(t, false, r.AllowedToReuse(lastTime))
+		require.Equal(t, true, r.ExpiredBecauseUnused(lastTime))
+		require.Equal(t, true, r.CompletelyExpired(lastTime))
+	})
 }

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"net/http"
@@ -13,6 +12,7 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/stretchr/testify/require"
 
+	"github.com/dexidp/dex/server/signer"
 	"github.com/dexidp/dex/storage"
 	"github.com/dexidp/dex/storage/memory"
 )
@@ -53,6 +53,7 @@ func TestParseAuthorizationRequest(t *testing.T) {
 		name                   string
 		clients                []storage.Client
 		supportedResponseTypes []string
+		pkce                   PKCEConfig
 
 		usePOST bool
 
@@ -319,16 +320,102 @@ func TestParseAuthorizationRequest(t *testing.T) {
 			},
 			expectedError: &redirectedAuthErr{Type: errInvalidRequest},
 		},
+		{
+			name: "PKCE enforced, no code_challenge provided",
+			clients: []storage.Client{
+				{
+					ID:           "bar",
+					RedirectURIs: []string{"https://example.com/bar"},
+				},
+			},
+			supportedResponseTypes: []string{"code"},
+			pkce: PKCEConfig{
+				Enforce:                       true,
+				CodeChallengeMethodsSupported: []string{"S256", "plain"},
+			},
+			queryParams: map[string]string{
+				"client_id":     "bar",
+				"redirect_uri":  "https://example.com/bar",
+				"response_type": "code",
+				"scope":         "openid email profile",
+			},
+			expectedError: &redirectedAuthErr{Type: errInvalidRequest},
+		},
+		{
+			name: "PKCE enforced, code_challenge provided",
+			clients: []storage.Client{
+				{
+					ID:           "bar",
+					RedirectURIs: []string{"https://example.com/bar"},
+				},
+			},
+			supportedResponseTypes: []string{"code"},
+			pkce: PKCEConfig{
+				Enforce:                       true,
+				CodeChallengeMethodsSupported: []string{"S256", "plain"},
+			},
+			queryParams: map[string]string{
+				"client_id":             "bar",
+				"redirect_uri":          "https://example.com/bar",
+				"response_type":         "code",
+				"code_challenge":        "123",
+				"code_challenge_method": "S256",
+				"scope":                 "openid email profile",
+			},
+		},
+		{
+			name: "PKCE only S256 allowed, plain rejected",
+			clients: []storage.Client{
+				{
+					ID:           "bar",
+					RedirectURIs: []string{"https://example.com/bar"},
+				},
+			},
+			supportedResponseTypes: []string{"code"},
+			pkce: PKCEConfig{
+				CodeChallengeMethodsSupported: []string{"S256"},
+			},
+			queryParams: map[string]string{
+				"client_id":             "bar",
+				"redirect_uri":          "https://example.com/bar",
+				"response_type":         "code",
+				"code_challenge":        "123",
+				"code_challenge_method": "plain",
+				"scope":                 "openid email profile",
+			},
+			expectedError: &redirectedAuthErr{Type: errInvalidRequest},
+		},
+		{
+			name: "PKCE only S256 allowed, S256 accepted",
+			clients: []storage.Client{
+				{
+					ID:           "bar",
+					RedirectURIs: []string{"https://example.com/bar"},
+				},
+			},
+			supportedResponseTypes: []string{"code"},
+			pkce: PKCEConfig{
+				CodeChallengeMethodsSupported: []string{"S256"},
+			},
+			queryParams: map[string]string{
+				"client_id":             "bar",
+				"redirect_uri":          "https://example.com/bar",
+				"response_type":         "code",
+				"code_challenge":        "123",
+				"code_challenge_method": "S256",
+				"scope":                 "openid email profile",
+			},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			httpServer, server := newTestServerMultipleConnectors(ctx, t, func(c *Config) {
+			httpServer, server := newTestServerMultipleConnectors(t, func(c *Config) {
 				c.SupportedResponseTypes = tc.supportedResponseTypes
 				c.Storage = storage.WithStaticClients(c.Storage, tc.clients)
+				if len(tc.pkce.CodeChallengeMethodsSupported) > 0 || tc.pkce.Enforce {
+					c.PKCE = tc.pkce
+				}
 			})
 			defer httpServer.Close()
 
@@ -450,6 +537,27 @@ func TestValidRedirectURI(t *testing.T) {
 				Public: true,
 			},
 			redirectURI: "http://localhost",
+			wantValid:   true,
+		},
+		{
+			client: storage.Client{
+				Public: true,
+			},
+			redirectURI: "http://127.0.0.1:8080/",
+			wantValid:   true,
+		},
+		{
+			client: storage.Client{
+				Public: true,
+			},
+			redirectURI: "http://127.0.0.1:991/bar",
+			wantValid:   true,
+		},
+		{
+			client: storage.Client{
+				Public: true,
+			},
+			redirectURI: "http://127.0.0.1",
 			wantValid:   true,
 		},
 		// Both Public + RedirectURIs configured: Could e.g. be a PKCE-enabled web app.
@@ -576,9 +684,10 @@ func TestValidRedirectURI(t *testing.T) {
 	}
 }
 
-func TestStorageKeySet(t *testing.T) {
+func TestSignerKeySet(t *testing.T) {
+	logger := newLogger(t)
 	s := memory.New(logger)
-	if err := s.UpdateKeys(func(keys storage.Keys) (storage.Keys, error) {
+	if err := s.UpdateKeys(t.Context(), func(keys storage.Keys) (storage.Keys, error) {
 		keys.SigningKey = &jose.JSONWebKey{
 			Key:       testKey,
 			KeyID:     "testkey",
@@ -650,11 +759,126 @@ func TestStorageKeySet(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			keySet := &storageKeySet{s}
+			// Create a mock signer for testing
+			sig, err := signer.NewMockSigner(testKey)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-			_, err = keySet.VerifySignature(context.Background(), jwt)
+			keySet := &signerKeySet{
+				signer: sig,
+			}
+
+			_, err = keySet.VerifySignature(t.Context(), jwt)
 			if (err != nil && !tc.wantErr) || (err == nil && tc.wantErr) {
 				t.Fatalf("wantErr = %v, but got err = %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestRedirectedAuthErrHandler(t *testing.T) {
+	tests := []struct {
+		name        string
+		redirectURI string
+		state       string
+		errType     string
+		description string
+		wantStatus  int
+		wantErr     bool
+	}{
+		{
+			name:        "valid redirect uri with error parameters",
+			redirectURI: "https://example.com/callback",
+			state:       "state123",
+			errType:     errInvalidRequest,
+			description: "Invalid request parameter",
+			wantStatus:  http.StatusSeeOther,
+			wantErr:     false,
+		},
+		{
+			name:        "valid redirect uri with query params",
+			redirectURI: "https://example.com/callback?existing=param&another=value",
+			state:       "state456",
+			errType:     errAccessDenied,
+			description: "User denied access",
+			wantStatus:  http.StatusSeeOther,
+			wantErr:     false,
+		},
+		{
+			name:        "valid redirect uri without description",
+			redirectURI: "https://example.com/callback",
+			state:       "state789",
+			errType:     errServerError,
+			description: "",
+			wantStatus:  http.StatusSeeOther,
+			wantErr:     false,
+		},
+		{
+			name:        "invalid redirect uri",
+			redirectURI: "not a valid url ://",
+			state:       "state",
+			errType:     errInvalidRequest,
+			description: "Test error",
+			wantStatus:  http.StatusBadRequest,
+			wantErr:     true,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			err := &redirectedAuthErr{
+				State:       tc.state,
+				RedirectURI: tc.redirectURI,
+				Type:        tc.errType,
+				Description: tc.description,
+			}
+
+			handler := err.Handler()
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest("GET", "/", nil)
+
+			handler.ServeHTTP(w, r)
+
+			if w.Code != tc.wantStatus {
+				t.Errorf("expected status %d, got %d", tc.wantStatus, w.Code)
+			}
+
+			if tc.wantStatus == http.StatusSeeOther {
+				// Verify the redirect location is a valid URL
+				location := w.Header().Get("Location")
+				if location == "" {
+					t.Fatalf("expected Location header, got empty string")
+				}
+
+				// Parse the redirect URL to verify it's valid
+				redirectURL, parseErr := url.Parse(location)
+				if parseErr != nil {
+					t.Fatalf("invalid redirect URL: %v", parseErr)
+				}
+
+				// Verify error parameters are present in the query string
+				query := redirectURL.Query()
+				if query.Get("state") != tc.state {
+					t.Errorf("expected state %q, got %q", tc.state, query.Get("state"))
+				}
+				if query.Get("error") != tc.errType {
+					t.Errorf("expected error type %q, got %q", tc.errType, query.Get("error"))
+				}
+				if tc.description != "" && query.Get("error_description") != tc.description {
+					t.Errorf("expected error_description %q, got %q", tc.description, query.Get("error_description"))
+				}
+
+				// Verify that existing query parameters are preserved
+				if tc.name == "valid redirect uri with query params" {
+					if query.Get("existing") != "param" {
+						t.Errorf("expected existing parameter 'param', got %q", query.Get("existing"))
+					}
+					if query.Get("another") != "value" {
+						t.Errorf("expected another parameter 'value', got %q", query.Get("another"))
+					}
+				}
 			}
 		})
 	}

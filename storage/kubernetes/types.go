@@ -251,6 +251,8 @@ type Client struct {
 
 	Name    string `json:"name,omitempty"`
 	LogoURL string `json:"logoURL,omitempty"`
+
+	AllowedConnectors []string `json:"allowedConnectors,omitempty"`
 }
 
 // ClientList is a list of Clients.
@@ -270,25 +272,27 @@ func (cli *client) fromStorageClient(c storage.Client) Client {
 			Name:      cli.idToName(c.ID),
 			Namespace: cli.namespace,
 		},
-		ID:           c.ID,
-		Secret:       c.Secret,
-		RedirectURIs: c.RedirectURIs,
-		TrustedPeers: c.TrustedPeers,
-		Public:       c.Public,
-		Name:         c.Name,
-		LogoURL:      c.LogoURL,
+		ID:                c.ID,
+		Secret:            c.Secret,
+		RedirectURIs:      c.RedirectURIs,
+		TrustedPeers:      c.TrustedPeers,
+		Public:            c.Public,
+		Name:              c.Name,
+		LogoURL:           c.LogoURL,
+		AllowedConnectors: c.AllowedConnectors,
 	}
 }
 
 func toStorageClient(c Client) storage.Client {
 	return storage.Client{
-		ID:           c.ID,
-		Secret:       c.Secret,
-		RedirectURIs: c.RedirectURIs,
-		TrustedPeers: c.TrustedPeers,
-		Public:       c.Public,
-		Name:         c.Name,
-		LogoURL:      c.LogoURL,
+		ID:                c.ID,
+		Secret:            c.Secret,
+		RedirectURIs:      c.RedirectURIs,
+		TrustedPeers:      c.TrustedPeers,
+		Public:            c.Public,
+		Name:              c.Name,
+		LogoURL:           c.LogoURL,
+		AllowedConnectors: c.AllowedConnectors,
 	}
 }
 
@@ -431,9 +435,13 @@ type Password struct {
 	// This field is IMMUTABLE. Do not change.
 	Email string `json:"email,omitempty"`
 
-	Hash     []byte `json:"hash,omitempty"`
-	Username string `json:"username,omitempty"`
-	UserID   string `json:"userID,omitempty"`
+	Hash              []byte   `json:"hash,omitempty"`
+	Username          string   `json:"username,omitempty"`
+	Name              string   `json:"name,omitempty"`
+	PreferredUsername string   `json:"preferredUsername,omitempty"`
+	EmailVerified     *bool    `json:"emailVerified,omitempty"`
+	UserID            string   `json:"userID,omitempty"`
+	Groups            []string `json:"groups,omitempty"`
 }
 
 // PasswordList is a list of Passwords.
@@ -454,19 +462,27 @@ func (cli *client) fromStoragePassword(p storage.Password) Password {
 			Name:      cli.idToName(email),
 			Namespace: cli.namespace,
 		},
-		Email:    email,
-		Hash:     p.Hash,
-		Username: p.Username,
-		UserID:   p.UserID,
+		Email:             email,
+		Hash:              p.Hash,
+		Username:          p.Username,
+		Name:              p.Name,
+		PreferredUsername: p.PreferredUsername,
+		EmailVerified:     p.EmailVerified,
+		UserID:            p.UserID,
+		Groups:            p.Groups,
 	}
 }
 
 func toStoragePassword(p Password) storage.Password {
 	return storage.Password{
-		Email:    p.Email,
-		Hash:     p.Hash,
-		Username: p.Username,
-		UserID:   p.UserID,
+		Email:             p.Email,
+		Hash:              p.Hash,
+		Username:          p.Username,
+		Name:              p.Name,
+		PreferredUsername: p.PreferredUsername,
+		EmailVerified:     p.EmailVerified,
+		UserID:            p.UserID,
+		Groups:            p.Groups,
 	}
 }
 
@@ -709,6 +725,8 @@ type Connector struct {
 	Name string `json:"name,omitempty"`
 	// Config holds connector specific configuration information
 	Config []byte `json:"config,omitempty"`
+	// GrantTypes is a list of grant types that this connector is allowed to be used with.
+	GrantTypes []string `json:"grantTypes,omitempty"`
 }
 
 func (cli *client) fromStorageConnector(c storage.Connector) Connector {
@@ -721,10 +739,11 @@ func (cli *client) fromStorageConnector(c storage.Connector) Connector {
 			Name:      c.ID,
 			Namespace: cli.namespace,
 		},
-		ID:     c.ID,
-		Type:   c.Type,
-		Name:   c.Name,
-		Config: c.Config,
+		ID:         c.ID,
+		Type:       c.Type,
+		Name:       c.Name,
+		Config:     c.Config,
+		GrantTypes: c.GrantTypes,
 	}
 }
 
@@ -735,6 +754,7 @@ func toStorageConnector(c Connector) storage.Connector {
 		Name:            c.Name,
 		ResourceVersion: c.ObjectMeta.ResourceVersion,
 		Config:          c.Config,
+		GrantTypes:      c.GrantTypes,
 	}
 }
 
