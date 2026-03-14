@@ -73,11 +73,26 @@ jobs:
 
       - name: Set Docker Hub image name
         id: dockerhub-image
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
           if [ "${{ github.repository }}" = "dexidp/dex" ]; then
             echo "value=dexidp/dex" >> "$GITHUB_OUTPUT"
           else
-            echo "value=${{ secrets.DOCKER_USERNAME }}/dex" >> "$GITHUB_OUTPUT"
+            # Authenticate with Docker Hub and list repositories to find the correct one
+            TOKEN=$(curl -sf -X POST https://hub.docker.com/v2/users/login \
+              -H "Content-Type: application/json" \
+              -d "{\"username\":\"${DOCKER_USERNAME}\",\"password\":\"${DOCKER_PASSWORD}\"}" \
+              | jq -r .token)
+
+            # Find a repo whose name contains "dex" (case-insensitive), fall back to "dex"
+            REPO=$(curl -sf -H "Authorization: Bearer ${TOKEN}" \
+              "https://hub.docker.com/v2/repositories/${DOCKER_USERNAME}/?page_size=100" \
+              | jq -r '.results[].name' | grep -i 'dex' | head -1)
+
+            REPO=${REPO:-dex}
+            echo "value=${DOCKER_USERNAME}/${REPO}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Gather build metadata
@@ -98,6 +113,8 @@ jobs:
             type=ref,event=pr,prefix=pr-,suffix=-${{ matrix.variant }}
             type=semver,pattern={{raw}},suffix=-${{ matrix.variant }}
             type=raw,value=latest,enable={{is_default_branch}},suffix=-${{ matrix.variant }}
+            type=semver,pattern={{raw}}.1,enable=${{ matrix.variant == 'alpine' }}
+            type=semver,pattern={{raw}}.1,suffix=-${{ matrix.variant }}
           labels: |
             org.opencontainers.image.documentation=https://dexidp.io/docs/
 
