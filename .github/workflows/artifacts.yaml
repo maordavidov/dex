@@ -8,6 +8,16 @@ on:
         default: false
         required: false
         type: boolean
+      upstream-version:
+        description: >
+          Upstream dex version tag to build (e.g. v2.42.0).
+          When set the workflow creates a local git tag so git-version and
+          docker/metadata-action both see the correct version, and emits the
+          extra fork-build tags (e.g. v2.42.0.1).  Leave empty when the
+          workflow is triggered by a real git tag push.
+        default: ''
+        required: false
+        type: string
     secrets:
       DOCKER_USERNAME:
         required: true
@@ -54,6 +64,10 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-tags: true
+
+      - name: Pin local checkout to upstream version
+        if: inputs.upstream-version != ''
+        run: git tag "${{ inputs.upstream-version }}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
@@ -115,6 +129,10 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}},suffix=-${{ matrix.variant }}
             type=semver,pattern={{raw}}.1,enable=${{ matrix.variant == 'alpine' }}
             type=semver,pattern={{raw}}.1,suffix=-${{ matrix.variant }}
+            type=raw,value=${{ inputs.upstream-version }},enable=${{ matrix.variant == 'alpine' && inputs.upstream-version != '' }}
+            type=raw,value=${{ inputs.upstream-version }},suffix=-${{ matrix.variant }},enable=${{ inputs.upstream-version != '' }}
+            type=raw,value=${{ inputs.upstream-version }}.1,enable=${{ matrix.variant == 'alpine' && inputs.upstream-version != '' }}
+            type=raw,value=${{ inputs.upstream-version }}.1,suffix=-${{ matrix.variant }},enable=${{ inputs.upstream-version != '' }}
           labels: |
             org.opencontainers.image.documentation=https://dexidp.io/docs/
 

@@ -1,0 +1,69 @@
+name: Fork Release
+
+# Triggers a Docker Hub publish using the latest upstream dex release tag
+# without requiring a manual git tag push.
+#
+# Behaviour:
+#   - workflow_dispatch: run manually from the Actions tab, with an optional
+#     version override (defaults to auto-detecting the latest upstream tag).
+#   - schedule: runs weekly on Monday to catch new upstream releases automatically.
+#
+# Produced tags for upstream release v2.42.0:
+#   v2.42.0          (alpine, plain semver – same as upstream)
+#   v2.42.0-alpine
+#   v2.42.0-distroless
+#   v2.42.0.1        (alpine, fork-build marker)
+#   v2.42.0.1-alpine
+#   v2.42.0.1-distroless
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream-version:
+        description: >
+          Upstream dex version to build (e.g. v2.42.0).
+          Leave empty to auto-detect the latest upstream release.
+        required: false
+        default: ''
+  schedule:
+    # Every Monday at 08:00 UTC
+    - cron: '0 8 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  detect-version:
+    name: Detect upstream version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+    steps:
+      - name: Detect latest upstream dex release
+        id: detect
+        run: |
+          if [ -n "${{ inputs.upstream-version }}" ]; then
+            VERSION="${{ inputs.upstream-version }}"
+          else
+            VERSION=$(curl -sf https://api.github.com/repos/dexidp/dex/releases/latest \
+              | jq -r .tag_name)
+          fi
+          echo "Building upstream version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Build and publish
+    needs: detect-version
+    uses: ./.github/workflows/artifacts.yaml
+    with:
+      publish: true
+      upstream-version: ${{ needs.detect-version.outputs.version }}
+    secrets:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+    permissions:
+      attestations: write
+      contents: read
+      packages: write
+      id-token: write
+      security-events: write
