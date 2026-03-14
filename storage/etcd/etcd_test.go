@@ -3,13 +3,13 @@ package etcd
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/dexidp/dex/storage"
@@ -55,12 +55,6 @@ func cleanDB(c *conn) error {
 	return nil
 }
 
-var logger = &logrus.Logger{
-	Out:       os.Stderr,
-	Formatter: &logrus.TextFormatter{DisableColors: true},
-	Level:     logrus.DebugLevel,
-}
-
 func TestEtcd(t *testing.T) {
 	testEtcdEnv := "DEX_ETCD_ENDPOINTS"
 	endpointsStr := os.Getenv(testEtcdEnv)
@@ -70,10 +64,11 @@ func TestEtcd(t *testing.T) {
 	}
 	endpoints := strings.Split(endpointsStr, ",")
 
-	newStorage := func() storage.Storage {
+	newStorage := func(t *testing.T) storage.Storage {
 		s := &Etcd{
 			Endpoints: endpoints,
 		}
+		logger := slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelDebug}))
 		conn, err := s.open(logger)
 		if err != nil {
 			fmt.Fprintln(os.Stdout, err)
@@ -94,4 +89,11 @@ func TestEtcd(t *testing.T) {
 	withTimeout(time.Minute*1, func() {
 		conformance.RunTransactionTests(t, newStorage)
 	})
+
+	// TODO(nabokihms): etcd uses compare-and-swap (txnUpdate) for UpdateRefreshToken,
+	// but does not retry on CAS conflicts ("concurrent conflicting update happened").
+	// Under high contention virtually all updates fail — only the first writer succeeds.
+	// withTimeout(time.Minute*1, func() {
+	// 	  conformance.RunConcurrencyTests(t, newStorage)
+	// })
 }

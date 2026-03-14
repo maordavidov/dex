@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -11,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
 
 	"github.com/dexidp/dex/connector"
@@ -37,7 +37,7 @@ func TestOpen(t *testing.T) {
 		InsecureCA:   true,
 	}
 
-	logger := logrus.New()
+	logger := slog.New(slog.DiscardHandler)
 
 	oconfig, err := c.Open("id", logger)
 
@@ -175,7 +175,7 @@ func TestCallbackIdentity(t *testing.T) {
 			TokenURL: fmt.Sprintf("%s/oauth/token", s.URL),
 		},
 	}}
-	identity, err := oc.HandleCallback(connector.Scopes{Groups: true}, req)
+	identity, err := oc.HandleCallback(connector.Scopes{Groups: true}, nil, req)
 
 	expectNil(t, err)
 	expectEquals(t, identity.UserID, "12345")

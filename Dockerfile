@@ -1,8 +1,8 @@
 ARG BASE_IMAGE=alpine
 
-FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.4.0@sha256:0cd3f05c72d6c9b038eb135f91376ee1169ef3a330d34e418e65e2a5c2e9c0d4 AS xx
+FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.9.0@sha256:c64defb9ed5a91eacb37f96ccc3d4cd72521c4bd18d5442905b95e2226b0e707 AS xx
 
-FROM --platform=$BUILDPLATFORM golang:1.22.2-alpine3.18@sha256:d995eb689a0c123590a3d34c65f57f3a118bda3fa26f92da5e089ae7d8fd81a0 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.1-alpine3.22@sha256:07e91d24f6330432729082bb580983181809e0a48f0f38ecde26868d4568c6ac AS builder
 
 COPY --from=xx / /
 
@@ -35,27 +35,31 @@ RUN make release-binary
 
 RUN xx-verify /go/bin/dex && xx-verify /go/bin/docker-entrypoint
 
-FROM alpine:3.19.1@sha256:c5b1261d6d3e43071626931fc004f70149baeba2c8ec672bd4f27761f8e1ad6b AS stager
+FROM alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659 AS stager
 
 RUN mkdir -p /var/dex
 RUN mkdir -p /etc/dex
 COPY config.docker.yaml /etc/dex/
 
-FROM alpine:3.19.1@sha256:c5b1261d6d3e43071626931fc004f70149baeba2c8ec672bd4f27761f8e1ad6b AS gomplate
+FROM alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659 AS gomplate
 
 ARG TARGETOS
 ARG TARGETARCH
 ARG TARGETVARIANT
 
-ENV GOMPLATE_VERSION=v3.11.7
+ENV GOMPLATE_VERSION=v5.0.0
 
 RUN wget -O /usr/local/bin/gomplate \
-  "https://github.com/hairyhenderson/gomplate/releases/download/${GOMPLATE_VERSION}/gomplate_${TARGETOS:-linux}-${TARGETARCH:-amd64}${TARGETVARIANT}" \
-  && chmod +x /usr/local/bin/gomplate
+    "https://github.com/hairyhenderson/gomplate/releases/download/${GOMPLATE_VERSION}/gomplate_${TARGETOS:-linux}-${TARGETARCH:-amd64}${TARGETVARIANT}" \
+    && chmod +x /usr/local/bin/gomplate
 
 # For Dependabot to detect base image versions
-FROM alpine:3.19.1@sha256:c5b1261d6d3e43071626931fc004f70149baeba2c8ec672bd4f27761f8e1ad6b AS alpine
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:42c88655018248be5b8ed88261fca620f6d0dd55996fbb591de4969f250120e9 AS distroless
+FROM alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659 AS alpine
+
+FROM alpine AS user-setup
+RUN addgroup -g 1001 -S dex && adduser -u 1001 -S -G dex -D -H -s /sbin/nologin dex
+
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:f512d819b8f109f2375e8b51d8cfd8aafe81034bc3e319740128b7d7f70d5036 AS distroless
 
 FROM $BASE_IMAGE
 
@@ -65,6 +69,10 @@ FROM $BASE_IMAGE
 #
 # See https://go.dev/src/crypto/x509/root_linux.go for Go root CA bundle locations.
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# Ensure the dex user/group exist before setting ownership or switching to them.
+COPY --from=user-setup /etc/passwd /etc/passwd
+COPY --from=user-setup /etc/group /etc/group
 
 COPY --from=stager --chown=1001:1001 /var/dex /var/dex
 COPY --from=stager --chown=1001:1001 /etc/dex /etc/dex
@@ -79,7 +87,7 @@ COPY --from=builder /usr/local/src/dex/web /srv/dex/web
 
 COPY --from=gomplate /usr/local/bin/gomplate /usr/local/bin/gomplate
 
-USER 1001:1001
+USER dex:dex
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint"]
 CMD ["dex", "serve", "/etc/dex/config.docker.yaml"]

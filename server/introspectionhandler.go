@@ -170,7 +170,7 @@ func (s *Server) getTokenFromRequest(r *http.Request) (string, TokenTypeEnum, er
 		return "", 0, newIntrospectBadRequestError(fmt.Sprintf("HTTP method is \"%s\", expected \"POST\".", r.Method))
 	} else if err := r.ParseForm(); err != nil {
 		return "", 0, newIntrospectBadRequestError("Unable to parse HTTP body, make sure to send a properly formatted form request body.")
-	} else if r.PostForm == nil || len(r.PostForm) == 0 {
+	} else if len(r.PostForm) == 0 {
 		return "", 0, newIntrospectBadRequestError("The POST body can not be empty.")
 	} else if !r.PostForm.Has("token") {
 		return "", 0, newIntrospectBadRequestError("The POST body doesn't contain 'token' parameter.")
@@ -179,21 +179,21 @@ func (s *Server) getTokenFromRequest(r *http.Request) (string, TokenTypeEnum, er
 	token := r.PostForm.Get("token")
 	tokenType, err := s.guessTokenType(r.Context(), token)
 	if err != nil {
-		s.logger.Error(err)
+		s.logger.ErrorContext(r.Context(), "failed to guess token type", "err", err)
 		return "", 0, newIntrospectInternalServerError()
 	}
 
 	requestTokenType := r.PostForm.Get("token_type_hint")
 	if requestTokenType != "" {
 		if tokenType.String() != requestTokenType {
-			s.logger.Warnf("Token type hint doesn't match token type: %s != %s", requestTokenType, tokenType)
+			s.logger.Warn("token type hint doesn't match token type", "request_token_type", requestTokenType, "token_type", tokenType)
 		}
 	}
 
 	return token, tokenType, nil
 }
 
-func (s *Server) introspectRefreshToken(_ context.Context, token string) (*Introspection, error) {
+func (s *Server) introspectRefreshToken(ctx context.Context, token string) (*Introspection, error) {
 	rToken := new(internal.RefreshToken)
 	if err := internal.Unmarshal(token, rToken); err != nil {
 		// For backward compatibility, assume the refresh_token is a raw refresh token ID
@@ -205,19 +205,19 @@ func (s *Server) introspectRefreshToken(_ context.Context, token string) (*Intro
 		rToken = &internal.RefreshToken{RefreshId: token, Token: ""}
 	}
 
-	rCtx, err := s.getRefreshTokenFromStorage(nil, rToken)
+	rCtx, err := s.getRefreshTokenFromStorage(ctx, nil, rToken)
 	if err != nil {
 		if errors.Is(err, invalidErr) || errors.Is(err, expiredErr) {
 			return nil, newIntrospectInactiveTokenError()
 		}
 
-		s.logger.Errorf("failed to get refresh token: %v", err)
+		s.logger.ErrorContext(ctx, "failed to get refresh token", "err", err)
 		return nil, newIntrospectInternalServerError()
 	}
 
 	subjectString, sErr := genSubject(rCtx.storageToken.Claims.UserID, rCtx.storageToken.ConnectorID)
 	if sErr != nil {
-		s.logger.Errorf("failed to marshal offline session ID: %v", err)
+		s.logger.ErrorContext(ctx, "failed to marshal offline session ID", "err", err)
 		return nil, newIntrospectInternalServerError()
 	}
 
@@ -245,7 +245,7 @@ func (s *Server) introspectRefreshToken(_ context.Context, token string) (*Intro
 }
 
 func (s *Server) introspectAccessToken(ctx context.Context, token string) (*Introspection, error) {
-	verifier := oidc.NewVerifier(s.issuerURL.String(), &storageKeySet{s.storage}, &oidc.Config{SkipClientIDCheck: true})
+	verifier := oidc.NewVerifier(s.issuerURL.String(), &signerKeySet{s.signer}, &oidc.Config{SkipClientIDCheck: true})
 	idToken, err := verifier.Verify(ctx, token)
 	if err != nil {
 		return nil, newIntrospectInactiveTokenError()
@@ -253,19 +253,19 @@ func (s *Server) introspectAccessToken(ctx context.Context, token string) (*Intr
 
 	var claims IntrospectionExtra
 	if err := idToken.Claims(&claims); err != nil {
-		s.logger.Errorf("Error while fetching token claims: %s", err.Error())
+		s.logger.ErrorContext(ctx, "error while fetching token claims", "err", err.Error())
 		return nil, newIntrospectInternalServerError()
 	}
 
 	clientID, err := getClientID(idToken.Audience, claims.AuthorizingParty)
 	if err != nil {
-		s.logger.Error("Error while fetching client_id from token: %s", err.Error())
+		s.logger.ErrorContext(ctx, "error while fetching client_id from token:", "err", err.Error())
 		return nil, newIntrospectInternalServerError()
 	}
 
-	client, err := s.storage.GetClient(clientID)
+	client, err := s.storage.GetClient(ctx, clientID)
 	if err != nil {
-		s.logger.Error("Error while fetching client from storage: %s", err.Error())
+		s.logger.ErrorContext(ctx, "error while fetching client from storage", "err", err.Error())
 		return nil, newIntrospectInternalServerError()
 	}
 
@@ -299,7 +299,7 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 			introspect, err = s.introspectRefreshToken(ctx, token)
 		default:
 			// Token type is neither handled token types.
-			s.logger.Errorf("Unknown token type: %s", tokenType)
+			s.logger.ErrorContext(r.Context(), "unknown token type", "token_type", tokenType)
 			introspectInactiveErr(w)
 			return
 		}
@@ -309,7 +309,7 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		if intErr, ok := err.(*introspectionError); ok {
 			s.introspectErrHelper(w, intErr.typ, intErr.desc, intErr.code)
 		} else {
-			s.logger.Errorf("An unknown error occurred: %s", err.Error())
+			s.logger.ErrorContext(r.Context(), "an unknown error occurred", "err", err.Error())
 			s.introspectErrHelper(w, errServerError, "An unknown error occurred", http.StatusInternalServerError)
 		}
 
@@ -318,7 +318,9 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 
 	rawJSON, jsonErr := json.Marshal(introspect)
 	if jsonErr != nil {
-		s.introspectErrHelper(w, errServerError, jsonErr.Error(), 500)
+		s.logger.ErrorContext(r.Context(), "failed to marshal introspection response", "err", jsonErr)
+		s.introspectErrHelper(w, errServerError, "", http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -332,7 +334,8 @@ func (s *Server) introspectErrHelper(w http.ResponseWriter, typ string, descript
 	}
 
 	if err := tokenErr(w, typ, description, statusCode); err != nil {
-		s.logger.Errorf("introspect error response: %v", err)
+		// TODO(nabokihms): error with context
+		s.logger.Error("introspect error response", "err", err)
 	}
 }
 

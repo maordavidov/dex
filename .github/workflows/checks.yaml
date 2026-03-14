@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Check minimum labels
-        uses: mheap/github-action-required-labels@132879b972cb7f2ac593006455875098e73cc7f2 # v5.4.0
+        uses: mheap/github-action-required-labels@8afbe8ae6ab7647d0c9f0cfa7c2f939650d22509 # v5.5
         with:
           mode: minimum
           count: 1

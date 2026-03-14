@@ -2,27 +2,30 @@ package server
 
 import (
 	"context"
-	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	gosundheit "github.com/AppsFlyer/go-sundheit"
-	"github.com/felixge/httpsnoop"
+	"github.com/google/uuid"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/dexidp/dex/connector"
@@ -42,7 +45,7 @@ import (
 	"github.com/dexidp/dex/connector/oidc"
 	"github.com/dexidp/dex/connector/openshift"
 	"github.com/dexidp/dex/connector/saml"
-	"github.com/dexidp/dex/pkg/log"
+	"github.com/dexidp/dex/server/signer"
 	"github.com/dexidp/dex/storage"
 	"github.com/dexidp/dex/web"
 )
@@ -55,6 +58,13 @@ const LocalConnector = "local"
 type Connector struct {
 	ResourceVersion string
 	Connector       connector.Connector
+	GrantTypes      []string
+}
+
+// GrantTypeAllowed checks if the given grant type is allowed for this connector.
+// If no grant types are configured, all are allowed.
+func GrantTypeAllowed(configuredTypes []string, grantType string) bool {
+	return len(configuredTypes) == 0 || slices.Contains(configuredTypes, grantType)
 }
 
 // Config holds the server's configuration options.
@@ -75,6 +85,10 @@ type Config struct {
 	// Headers is a map of headers to be added to the all responses.
 	Headers http.Header
 
+	// Header to extract real ip from.
+	RealIPHeader       string
+	TrustedRealIPCIDRs []netip.Prefix
+
 	// List of allowed origins for CORS requests on discovery, token and keys endpoint.
 	// If none are indicated, CORS requests are disabled. Passing in "*" will allow any
 	// domain.
@@ -90,7 +104,6 @@ type Config struct {
 	// If enabled, the connectors selection page will always be shown even if there's only one
 	AlwaysShowLoginScreen bool
 
-	RotateKeysAfter        time.Duration // Defaults to 6 hours.
 	IDTokensValidFor       time.Duration // Defaults to 24 hours
 	AuthRequestsValidFor   time.Duration // Defaults to 24 hours
 	DeviceRequestsValidFor time.Duration // Defaults to 5 minutes
@@ -101,6 +114,9 @@ type Config struct {
 	// If set, the server will use this connector to handle password grants
 	PasswordConnector string
 
+	// PKCE configuration
+	PKCE PKCEConfig
+
 	GCFrequency time.Duration // Defaults to 5 minutes
 
 	// If specified, the server will use this function for determining time.
@@ -108,11 +124,18 @@ type Config struct {
 
 	Web WebConfig
 
-	Logger log.Logger
+	Logger *slog.Logger
+
+	// Signer is used to sign tokens.
+	Signer signer.Signer
 
 	PrometheusRegistry *prometheus.Registry
 
 	HealthChecker gosundheit.Health
+
+	// If enabled, the server will continue starting even if some connectors fail to initialize.
+	// This allows the server to operate with a subset of connectors if some are misconfigured.
+	ContinueOnConnectorFailure bool
 }
 
 // WebConfig holds the server's frontend templates and asset configuration.
@@ -144,6 +167,14 @@ type WebConfig struct {
 
 	// Map of extra values passed into the templates
 	Extra map[string]string
+}
+
+// PKCEConfig holds PKCE (Proof Key for Code Exchange) settings.
+type PKCEConfig struct {
+	// If true, PKCE is required for all authorization code flows.
+	Enforce bool
+	// Supported code challenge methods. Defaults to ["S256", "plain"].
+	CodeChallengeMethodsSupported []string
 }
 
 func value(val, defaultValue time.Duration) time.Duration {
@@ -181,6 +212,8 @@ type Server struct {
 
 	supportedGrantTypes []string
 
+	pkce PKCEConfig
+
 	now func() time.Time
 
 	idTokensValidFor       time.Duration
@@ -189,25 +222,17 @@ type Server struct {
 
 	refreshTokenPolicy *RefreshTokenPolicy
 
-	logger log.Logger
+	logger *slog.Logger
+
+	signer signer.Signer
 }
 
 // NewServer constructs a server from the provided config.
 func NewServer(ctx context.Context, c Config) (*Server, error) {
-	return newServer(ctx, c, defaultRotationStrategy(
-		value(c.RotateKeysAfter, 6*time.Hour),
-		value(c.IDTokensValidFor, 24*time.Hour),
-	))
+	return newServer(ctx, c)
 }
 
-// NewServerWithKey constructs a server from the provided config and a static signing key.
-func NewServerWithKey(ctx context.Context, c Config, privateKey *rsa.PrivateKey) (*Server, error) {
-	return newServer(ctx, c, staticRotationStrategy(
-		privateKey,
-	))
-}
-
-func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy) (*Server, error) {
+func newServer(ctx context.Context, c Config) (*Server, error) {
 	issuerURL, err := url.Parse(c.Issuer)
 	if err != nil {
 		return nil, fmt.Errorf("server: can't parse issuer URL")
@@ -222,6 +247,19 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 	}
 	if len(c.AllowedHeaders) == 0 {
 		c.AllowedHeaders = []string{"Authorization"}
+	}
+
+	supportedChallengeMethods := map[string]bool{
+		codeChallengeMethodS256:  true,
+		codeChallengeMethodPlain: true,
+	}
+	if len(c.PKCE.CodeChallengeMethodsSupported) == 0 {
+		c.PKCE.CodeChallengeMethodsSupported = []string{codeChallengeMethodS256, codeChallengeMethodPlain}
+	}
+	for _, m := range c.PKCE.CodeChallengeMethodsSupported {
+		if !supportedChallengeMethods[m] {
+			return nil, fmt.Errorf("unsupported PKCE challenge method %q", m)
+		}
 	}
 
 	allSupportedGrants := map[string]bool{
@@ -249,6 +287,8 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 	if c.PasswordConnector != "" {
 		allSupportedGrants[grantTypePassword] = true
 	}
+
+	allSupportedGrants[grantTypeClientCredentials] = true
 
 	var supportedGrants []string
 	if len(c.AllowedGrantTypes) > 0 {
@@ -296,6 +336,7 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 		storage:                newKeyCacher(c.Storage, now),
 		supportedResponseTypes: supportedRes,
 		supportedGrantTypes:    supportedGrants,
+		pkce:                   c.PKCE,
 		idTokensValidFor:       value(c.IDTokensValidFor, 24*time.Hour),
 		authRequestsValidFor:   value(c.AuthRequestsValidFor, 24*time.Hour),
 		deviceRequestsValidFor: value(c.DeviceRequestsValidFor, 5*time.Minute),
@@ -306,11 +347,12 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 		templates:              tmpls,
 		passwordConnector:      c.PasswordConnector,
 		logger:                 c.Logger,
+		signer:                 c.Signer,
 	}
 
 	// Retrieves connector objects in backend storage. This list includes the static connectors
 	// defined in the ConfigMap and dynamic connectors retrieved from the storage.
-	storageConnectors, err := c.Storage.ListConnectors()
+	storageConnectors, err := c.Storage.ListConnectors(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("server: failed to list connector objects from storage: %v", err)
 	}
@@ -319,13 +361,23 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 		return nil, errors.New("server: no connectors specified")
 	}
 
+	var failedCount int
 	for _, conn := range storageConnectors {
 		if _, err := s.OpenConnector(conn); err != nil {
+			failedCount++
+			if c.ContinueOnConnectorFailure {
+				s.logger.Error("server: Failed to open connector", "id", conn.ID, "err", err)
+				continue
+			}
 			return nil, fmt.Errorf("server: Failed to open connector %s: %v", conn.ID, err)
 		}
 	}
 
-	instrumentHandlerCounter := func(_ string, handler http.Handler) http.HandlerFunc {
+	if c.ContinueOnConnectorFailure && failedCount == len(storageConnectors) {
+		return nil, fmt.Errorf("server: failed to open all connectors (%d/%d)", failedCount, len(storageConnectors))
+	}
+
+	instrumentHandler := func(_ string, handler http.Handler) http.HandlerFunc {
 		return handler.ServeHTTP
 	}
 
@@ -333,19 +385,57 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 		requestCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "http_requests_total",
 			Help: "Count of all HTTP requests.",
-		}, []string{"handler", "code", "method"})
+		}, []string{"code", "method", "handler"})
 
-		err = c.PrometheusRegistry.Register(requestCounter)
+		durationHist := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "request_duration_seconds",
+			Help:    "A histogram of latencies for requests.",
+			Buckets: []float64{.25, .5, 1, 2.5, 5, 10},
+		}, []string{"code", "method", "handler"})
+
+		sizeHist := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "response_size_bytes",
+			Help:    "A histogram of response sizes for requests.",
+			Buckets: []float64{200, 500, 900, 1500},
+		}, []string{"code", "method", "handler"})
+
+		c.PrometheusRegistry.MustRegister(requestCounter, durationHist, sizeHist)
+
+		instrumentHandler = func(handlerName string, handler http.Handler) http.HandlerFunc {
+			return promhttp.InstrumentHandlerDuration(durationHist.MustCurryWith(prometheus.Labels{"handler": handlerName}),
+				promhttp.InstrumentHandlerCounter(requestCounter.MustCurryWith(prometheus.Labels{"handler": handlerName}),
+					promhttp.InstrumentHandlerResponseSize(sizeHist.MustCurryWith(prometheus.Labels{"handler": handlerName}), handler),
+				),
+			)
+		}
+	}
+
+	parseRealIP := func(r *http.Request) (string, error) {
+		remoteAddr, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
-			return nil, fmt.Errorf("server: Failed to register Prometheus HTTP metrics: %v", err)
+			return "", err
 		}
 
-		instrumentHandlerCounter = func(handlerName string, handler http.Handler) http.HandlerFunc {
-			return func(w http.ResponseWriter, r *http.Request) {
-				m := httpsnoop.CaptureMetrics(handler, w, r)
-				requestCounter.With(prometheus.Labels{"handler": handlerName, "code": strconv.Itoa(m.Code), "method": r.Method}).Inc()
+		remoteIP, err := netip.ParseAddr(remoteAddr)
+		if err != nil {
+			return "", err
+		}
+
+		for _, n := range c.TrustedRealIPCIDRs {
+			if !n.Contains(remoteIP) {
+				return remoteAddr, nil // Fallback to the address from the request if the header is provided
 			}
 		}
+
+		ipVal := r.Header.Get(c.RealIPHeader)
+		if ipVal != "" {
+			ip, err := netip.ParseAddr(ipVal)
+			if err == nil {
+				return ip.String(), nil
+			}
+		}
+
+		return remoteAddr, nil
 	}
 
 	handlerWithHeaders := func(handlerName string, handler http.Handler) http.HandlerFunc {
@@ -353,7 +443,20 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 			for k, v := range c.Headers {
 				w.Header()[k] = v
 			}
-			instrumentHandlerCounter(handlerName, handler)(w, r)
+
+			// Context values are used for logging purposes with the log/slog logger.
+			rCtx := r.Context()
+			rCtx = WithRequestID(rCtx)
+
+			if c.RealIPHeader != "" {
+				realIP, err := parseRealIP(r)
+				if err == nil {
+					rCtx = WithRemoteIP(rCtx, realIP)
+				}
+			}
+
+			r = r.WithContext(rCtx)
+			instrumentHandler(handlerName, handler)(w, r)
 		}
 	}
 
@@ -381,11 +484,25 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 	}
 	r.NotFoundHandler = http.NotFoundHandler()
 
-	discoveryHandler, err := s.discoveryHandler()
+	discoveryHandler, err := s.discoveryHandler(ctx)
 	if err != nil {
 		return nil, err
 	}
 	handleWithCORS("/.well-known/openid-configuration", discoveryHandler)
+	// Handle the root path for the better user experience.
+	handleWithCORS("/", func(w http.ResponseWriter, r *http.Request) {
+		_, err := fmt.Fprintf(w, `<!DOCTYPE html>
+			<title>Dex</title>
+			<h1>Dex IdP</h1>
+			<h3>A Federated OpenID Connect Provider</h3>
+			<p><a href=%q>Discovery</a></p>`,
+			s.issuerURL.JoinPath(".well-known", "openid-configuration").String())
+		if err != nil {
+			s.logger.Error("failed to write response", "err", err)
+			s.renderError(r, w, http.StatusInternalServerError, "Handling the / path error.")
+			return
+		}
+	})
 
 	// TODO(ericchiang): rate limit certain paths based on IP.
 	handleWithCORS("/token", s.handleToken)
@@ -429,7 +546,7 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 
 	s.mux = r
 
-	s.startKeyRotation(ctx, rotationStrategy, now)
+	s.signer.Start(ctx)
 	s.startGarbageCollection(ctx, value(c.GCFrequency, 5*time.Minute), now)
 
 	return s, nil
@@ -463,8 +580,22 @@ type passwordDB struct {
 	s storage.Storage
 }
 
+func resolvePasswordName(p storage.Password) string {
+	if p.Name != "" {
+		return p.Name
+	}
+	return p.Username
+}
+
+func resolvePasswordEmailVerified(p storage.Password) bool {
+	if p.EmailVerified != nil {
+		return *p.EmailVerified
+	}
+	return true
+}
+
 func (db passwordDB) Login(ctx context.Context, s connector.Scopes, email, password string) (connector.Identity, bool, error) {
-	p, err := db.s.GetPassword(email)
+	p, err := db.s.GetPassword(ctx, email)
 	if err != nil {
 		if err != storage.ErrNotFound {
 			return connector.Identity{}, false, fmt.Errorf("get password: %v", err)
@@ -480,16 +611,18 @@ func (db passwordDB) Login(ctx context.Context, s connector.Scopes, email, passw
 		return connector.Identity{}, false, nil
 	}
 	return connector.Identity{
-		UserID:        p.UserID,
-		Username:      p.Username,
-		Email:         p.Email,
-		EmailVerified: true,
+		UserID:            p.UserID,
+		Username:          resolvePasswordName(p),
+		PreferredUsername: p.PreferredUsername,
+		Email:             p.Email,
+		EmailVerified:     resolvePasswordEmailVerified(p),
+		Groups:            p.Groups,
 	}, true, nil
 }
 
 func (db passwordDB) Refresh(ctx context.Context, s connector.Scopes, identity connector.Identity) (connector.Identity, error) {
 	// If the user has been deleted, the refresh token will be rejected.
-	p, err := db.s.GetPassword(identity.Email)
+	p, err := db.s.GetPassword(ctx, identity.Email)
 	if err != nil {
 		if err == storage.ErrNotFound {
 			return connector.Identity{}, errors.New("user not found")
@@ -506,8 +639,11 @@ func (db passwordDB) Refresh(ctx context.Context, s connector.Scopes, identity c
 	// refreshed token.
 	//
 	// No other fields are expected to be refreshable as email is effectively used
-	// as an ID and this implementation doesn't deal with groups.
-	identity.Username = p.Username
+	// as an ID.
+	identity.Username = resolvePasswordName(p)
+	identity.PreferredUsername = p.PreferredUsername
+	identity.EmailVerified = resolvePasswordEmailVerified(p)
+	identity.Groups = p.Groups
 
 	return identity, nil
 }
@@ -531,13 +667,13 @@ type keyCacher struct {
 	keys atomic.Value // Always holds nil or type *storage.Keys.
 }
 
-func (k *keyCacher) GetKeys() (storage.Keys, error) {
+func (k *keyCacher) GetKeys(ctx context.Context) (storage.Keys, error) {
 	keys, ok := k.keys.Load().(*storage.Keys)
 	if ok && keys != nil && k.now().Before(keys.NextRotation) {
 		return *keys, nil
 	}
 
-	storageKeys, err := k.Storage.GetKeys()
+	storageKeys, err := k.Storage.GetKeys(ctx)
 	if err != nil {
 		return storageKeys, err
 	}
@@ -555,11 +691,12 @@ func (s *Server) startGarbageCollection(ctx context.Context, frequency time.Dura
 			case <-ctx.Done():
 				return
 			case <-time.After(frequency):
-				if r, err := s.storage.GarbageCollect(now()); err != nil {
-					s.logger.Errorf("garbage collection failed: %v", err)
+				if r, err := s.storage.GarbageCollect(ctx, now()); err != nil {
+					s.logger.ErrorContext(ctx, "garbage collection failed", "err", err)
 				} else if !r.IsEmpty() {
-					s.logger.Infof("garbage collection run, delete auth requests=%d, auth codes=%d, device requests=%d, device tokens=%d",
-						r.AuthRequests, r.AuthCodes, r.DeviceRequests, r.DeviceTokens)
+					s.logger.InfoContext(ctx, "garbage collection run, delete auth",
+						"requests", r.AuthRequests, "auth_codes", r.AuthCodes,
+						"device_requests", r.DeviceRequests, "device_tokens", r.DeviceTokens)
 				}
 			}
 		}
@@ -568,7 +705,7 @@ func (s *Server) startGarbageCollection(ctx context.Context, frequency time.Dura
 
 // ConnectorConfig is a configuration that can open a connector.
 type ConnectorConfig interface {
-	Open(id string, logger log.Logger) (connector.Connector, error)
+	Open(id string, logger *slog.Logger) (connector.Connector, error)
 }
 
 // ConnectorsConfig variable provides an easy way to return a config struct
@@ -596,7 +733,7 @@ var ConnectorsConfig = map[string]func() ConnectorConfig{
 }
 
 // openConnector will parse the connector config and open the connector.
-func openConnector(logger log.Logger, conn storage.Connector) (connector.Connector, error) {
+func openConnector(logger *slog.Logger, conn storage.Connector) (connector.Connector, error) {
 	var c connector.Connector
 
 	f, ok := ConnectorsConfig[conn.Type]
@@ -637,6 +774,7 @@ func (s *Server) OpenConnector(conn storage.Connector) (Connector, error) {
 	connector := Connector{
 		ResourceVersion: conn.ResourceVersion,
 		Connector:       c,
+		GrantTypes:      conn.GrantTypes,
 	}
 	s.mu.Lock()
 	s.connectors[conn.ID] = connector
@@ -645,10 +783,17 @@ func (s *Server) OpenConnector(conn storage.Connector) (Connector, error) {
 	return connector, nil
 }
 
+// CloseConnector removes the connector from the server's in-memory map.
+func (s *Server) CloseConnector(id string) {
+	s.mu.Lock()
+	delete(s.connectors, id)
+	s.mu.Unlock()
+}
+
 // getConnector retrieves the connector object with the given id from the storage
 // and updates the connector list for server if necessary.
-func (s *Server) getConnector(id string) (Connector, error) {
-	storageConnector, err := s.storage.GetConnector(id)
+func (s *Server) getConnector(ctx context.Context, id string) (Connector, error) {
+	storageConnector, err := s.storage.GetConnector(ctx, id)
 	if err != nil {
 		return Connector{}, fmt.Errorf("failed to get connector object from storage: %v", err)
 	}
@@ -670,4 +815,19 @@ func (s *Server) getConnector(id string) (Connector, error) {
 	}
 
 	return conn, nil
+}
+
+type logRequestKey string
+
+const (
+	RequestKeyRequestID logRequestKey = "request_id"
+	RequestKeyRemoteIP  logRequestKey = "client_remote_addr"
+)
+
+func WithRequestID(ctx context.Context) context.Context {
+	return context.WithValue(ctx, RequestKeyRequestID, uuid.NewString())
+}
+
+func WithRemoteIP(ctx context.Context, ip string) context.Context {
+	return context.WithValue(ctx, RequestKeyRemoteIP, ip)
 }

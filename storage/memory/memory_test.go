@@ -1,24 +1,19 @@
 package memory
 
 import (
-	"os"
+	"log/slog"
 	"testing"
-
-	"github.com/sirupsen/logrus"
 
 	"github.com/dexidp/dex/storage"
 	"github.com/dexidp/dex/storage/conformance"
 )
 
 func TestStorage(t *testing.T) {
-	logger := &logrus.Logger{
-		Out:       os.Stderr,
-		Formatter: &logrus.TextFormatter{DisableColors: true},
-		Level:     logrus.DebugLevel,
-	}
+	newStorage := func(t *testing.T) storage.Storage {
+		logger := slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	newStorage := func() storage.Storage {
 		return New(logger)
 	}
 	conformance.RunTests(t, newStorage)
+	conformance.RunConcurrencyTests(t, newStorage)
 }

@@ -3,9 +3,6 @@ package server
 import (
 	"context"
 	"crypto"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
@@ -17,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +23,7 @@ import (
 
 	"github.com/dexidp/dex/connector"
 	"github.com/dexidp/dex/server/internal"
+	"github.com/dexidp/dex/server/signer"
 	"github.com/dexidp/dex/storage"
 )
 
@@ -66,13 +65,25 @@ func (err *redirectedAuthErr) Handler() http.Handler {
 		if err.Description != "" {
 			v.Add("error_description", err.Description)
 		}
-		var redirectURI string
-		if strings.Contains(err.RedirectURI, "?") {
-			redirectURI = err.RedirectURI + "&" + v.Encode()
-		} else {
-			redirectURI = err.RedirectURI + "?" + v.Encode()
+
+		// Parse the redirect URI to ensure it's valid before redirecting
+		u, parseErr := url.Parse(err.RedirectURI)
+		if parseErr != nil {
+			// If URI parsing fails, respond with an error instead of redirecting
+			http.Error(w, "Invalid redirect URI", http.StatusBadRequest)
+			return
 		}
-		http.Redirect(w, r, redirectURI, http.StatusSeeOther)
+
+		// Add error parameters to the URL
+		query := u.Query()
+		for key, values := range v {
+			for _, value := range values {
+				query.Add(key, value)
+			}
+		}
+		u.RawQuery = query.Encode()
+
+		http.Redirect(w, r, u.String(), http.StatusSeeOther)
 	}
 	return http.HandlerFunc(hf)
 }
@@ -133,7 +144,18 @@ const (
 	grantTypePassword          = "password"
 	grantTypeDeviceCode        = "urn:ietf:params:oauth:grant-type:device_code"
 	grantTypeTokenExchange     = "urn:ietf:params:oauth:grant-type:token-exchange"
+	grantTypeClientCredentials = "client_credentials"
 )
+
+// ConnectorGrantTypes is the set of grant types that can be restricted per connector.
+var ConnectorGrantTypes = map[string]bool{
+	grantTypeAuthorizationCode: true,
+	grantTypeRefreshToken:      true,
+	grantTypeImplicit:          true,
+	grantTypePassword:          true,
+	grantTypeDeviceCode:        true,
+	grantTypeTokenExchange:     true,
+}
 
 const (
 	// https://www.rfc-editor.org/rfc/rfc8693.html#section-3
@@ -173,54 +195,6 @@ func parseScopes(scopes []string) connector.Scopes {
 		}
 	}
 	return s
-}
-
-// Determine the signature algorithm for a JWT.
-func signatureAlgorithm(jwk *jose.JSONWebKey) (alg jose.SignatureAlgorithm, err error) {
-	if jwk.Key == nil {
-		return alg, errors.New("no signing key")
-	}
-	switch key := jwk.Key.(type) {
-	case *rsa.PrivateKey:
-		// Because OIDC mandates that we support RS256, we always return that
-		// value. In the future, we might want to make this configurable on a
-		// per client basis. For example allowing PS256 or ECDSA variants.
-		//
-		// See https://github.com/dexidp/dex/issues/692
-		return jose.RS256, nil
-	case *ecdsa.PrivateKey:
-		// We don't actually support ECDSA keys yet, but they're tested for
-		// in case we want to in the future.
-		//
-		// These values are prescribed depending on the ECDSA key type. We
-		// can't return different values.
-		switch key.Params() {
-		case elliptic.P256().Params():
-			return jose.ES256, nil
-		case elliptic.P384().Params():
-			return jose.ES384, nil
-		case elliptic.P521().Params():
-			return jose.ES512, nil
-		default:
-			return alg, errors.New("unsupported ecdsa curve")
-		}
-	default:
-		return alg, fmt.Errorf("unsupported signing key type %T", key)
-	}
-}
-
-func signPayload(key *jose.JSONWebKey, alg jose.SignatureAlgorithm, payload []byte) (jws string, err error) {
-	signingKey := jose.SigningKey{Key: key, Algorithm: alg}
-
-	signer, err := jose.NewSigner(signingKey, &jose.SignerOptions{})
-	if err != nil {
-		return "", fmt.Errorf("new signer: %v", err)
-	}
-	signature, err := signer.Sign(payload)
-	if err != nil {
-		return "", fmt.Errorf("signing payload: %v", err)
-	}
-	return signature.CompactSerialize()
 }
 
 // The hash algorithm for the at_hash is determined by the signing
@@ -303,8 +277,8 @@ type federatedIDClaims struct {
 	UserID      string `json:"user_id,omitempty"`
 }
 
-func (s *Server) newAccessToken(clientID string, claims storage.Claims, scopes []string, nonce, connID string) (accessToken string, expiry time.Time, err error) {
-	return s.newIDToken(clientID, claims, scopes, nonce, storage.NewID(), "", connID)
+func (s *Server) newAccessToken(ctx context.Context, clientID string, claims storage.Claims, scopes []string, nonce, connID string) (accessToken string, expiry time.Time, err error) {
+	return s.newIDToken(ctx, clientID, claims, scopes, nonce, storage.NewID(), "", connID)
 }
 
 func getClientID(aud audience, azp string) (string, error) {
@@ -350,28 +324,13 @@ func genSubject(userID string, connID string) (string, error) {
 	return internal.Marshal(sub)
 }
 
-func (s *Server) newIDToken(clientID string, claims storage.Claims, scopes []string, nonce, accessToken, code, connID string) (idToken string, expiry time.Time, err error) {
-	keys, err := s.storage.GetKeys()
-	if err != nil {
-		s.logger.Errorf("Failed to get keys: %v", err)
-		return "", expiry, err
-	}
-
-	signingKey := keys.SigningKey
-	if signingKey == nil {
-		return "", expiry, fmt.Errorf("no key to sign payload with")
-	}
-	signingAlg, err := signatureAlgorithm(signingKey)
-	if err != nil {
-		return "", expiry, err
-	}
-
+func (s *Server) newIDToken(ctx context.Context, clientID string, claims storage.Claims, scopes []string, nonce, accessToken, code, connID string) (idToken string, expiry time.Time, err error) {
 	issuedAt := s.now()
 	expiry = issuedAt.Add(s.idTokensValidFor)
 
 	subjectString, err := genSubject(claims.UserID, connID)
 	if err != nil {
-		s.logger.Errorf("failed to marshal offline session ID: %v", err)
+		s.logger.ErrorContext(ctx, "failed to marshal offline session ID", "err", err)
 		return "", expiry, fmt.Errorf("failed to marshal offline session ID: %v", err)
 	}
 
@@ -383,10 +342,17 @@ func (s *Server) newIDToken(clientID string, claims storage.Claims, scopes []str
 		IssuedAt: issuedAt.Unix(),
 	}
 
+	// Determine signing algorithm from signer
+	signingAlg, err := s.signer.Algorithm(ctx)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "failed to get signing algorithm", "err", err)
+		return "", expiry, fmt.Errorf("failed to get signing algorithm: %v", err)
+	}
+
 	if accessToken != "" {
 		atHash, err := accessTokenHash(signingAlg, accessToken)
 		if err != nil {
-			s.logger.Errorf("error computing at_hash: %v", err)
+			s.logger.ErrorContext(ctx, "error computing at_hash", "err", err)
 			return "", expiry, fmt.Errorf("error computing at_hash: %v", err)
 		}
 		tok.AccessTokenHash = atHash
@@ -395,7 +361,7 @@ func (s *Server) newIDToken(clientID string, claims storage.Claims, scopes []str
 	if code != "" {
 		cHash, err := accessTokenHash(signingAlg, code)
 		if err != nil {
-			s.logger.Errorf("error computing c_hash: %v", err)
+			s.logger.ErrorContext(ctx, "error computing c_hash", "err", err)
 			return "", expiry, fmt.Errorf("error computing c_hash: #{err}")
 		}
 		tok.CodeHash = cHash
@@ -423,7 +389,7 @@ func (s *Server) newIDToken(clientID string, claims storage.Claims, scopes []str
 				// initial auth request.
 				continue
 			}
-			isTrusted, err := s.validateCrossClientTrust(clientID, peerID)
+			isTrusted, err := s.validateCrossClientTrust(ctx, clientID, peerID)
 			if err != nil {
 				return "", expiry, err
 			}
@@ -445,7 +411,7 @@ func (s *Server) newIDToken(clientID string, claims storage.Claims, scopes []str
 		return "", expiry, fmt.Errorf("could not serialize claims: %v", err)
 	}
 
-	if idToken, err = signPayload(signingKey, signingAlg, payload); err != nil {
+	if idToken, err = s.signer.Sign(ctx, payload); err != nil {
 		return "", expiry, fmt.Errorf("failed to sign payload: %v", err)
 	}
 	return idToken, expiry, nil
@@ -453,6 +419,7 @@ func (s *Server) newIDToken(clientID string, claims storage.Claims, scopes []str
 
 // parse the initial request from the OAuth2 client.
 func (s *Server) parseAuthorizationRequest(r *http.Request) (*storage.AuthRequest, error) {
+	ctx := r.Context()
 	if err := r.ParseForm(); err != nil {
 		return nil, newDisplayedErr(http.StatusBadRequest, "Failed to parse request.")
 	}
@@ -477,20 +444,22 @@ func (s *Server) parseAuthorizationRequest(r *http.Request) (*storage.AuthReques
 		codeChallengeMethod = codeChallengeMethodPlain
 	}
 
-	client, err := s.storage.GetClient(clientID)
+	client, err := s.storage.GetClient(ctx, clientID)
 	if err != nil {
 		if err == storage.ErrNotFound {
-			return nil, newDisplayedErr(http.StatusNotFound, "Invalid client_id (%q).", clientID)
+			s.logger.ErrorContext(r.Context(), "invalid client_id provided", "client_id", clientID)
+			return nil, newDisplayedErr(http.StatusNotFound, "Invalid client_id.")
 		}
-		s.logger.Errorf("Failed to get client: %v", err)
+		s.logger.ErrorContext(r.Context(), "failed to get client", "err", err)
 		return nil, newDisplayedErr(http.StatusInternalServerError, "Database error.")
 	}
 
 	if !validateRedirectURI(client, redirectURI) {
-		return nil, newDisplayedErr(http.StatusBadRequest, "Unregistered redirect_uri (%q).", redirectURI)
+		s.logger.ErrorContext(r.Context(), "unregistered redirect_uri", "redirect_uri", redirectURI, "client_id", clientID)
+		return nil, newDisplayedErr(http.StatusBadRequest, "Unregistered redirect_uri.")
 	}
 	if redirectURI == deviceCallbackURI && client.Public {
-		redirectURI = s.issuerURL.Path + deviceCallbackURI
+		redirectURI = s.absPath(deviceCallbackURI)
 	}
 
 	// From here on out, we want to redirect back to the client with an error.
@@ -499,13 +468,16 @@ func (s *Server) parseAuthorizationRequest(r *http.Request) (*storage.AuthReques
 	}
 
 	if connectorID != "" {
-		connectors, err := s.storage.ListConnectors()
+		connectors, err := s.storage.ListConnectors(ctx)
 		if err != nil {
-			s.logger.Errorf("Failed to list connectors: %v", err)
+			s.logger.ErrorContext(r.Context(), "failed to list connectors", "err", err)
 			return nil, newRedirectedErr(errServerError, "Unable to retrieve connectors")
 		}
 		if !validateConnectorID(connectors, connectorID) {
 			return nil, newRedirectedErr(errInvalidRequest, "Invalid ConnectorID")
+		}
+		if !isConnectorAllowed(client.AllowedConnectors, connectorID) {
+			return nil, newRedirectedErr(errInvalidRequest, "Connector not allowed for this client")
 		}
 	}
 
@@ -515,9 +487,15 @@ func (s *Server) parseAuthorizationRequest(r *http.Request) (*storage.AuthReques
 		return nil, newRedirectedErr(errRequestNotSupported, "Server does not support request parameter.")
 	}
 
-	if codeChallengeMethod != codeChallengeMethodS256 && codeChallengeMethod != codeChallengeMethodPlain {
+	if codeChallenge != "" && !slices.Contains(s.pkce.CodeChallengeMethodsSupported, codeChallengeMethod) {
 		description := fmt.Sprintf("Unsupported PKCE challenge method (%q).", codeChallengeMethod)
 		return nil, newRedirectedErr(errInvalidRequest, description)
+	}
+
+	// Enforce PKCE if configured.
+	// https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-12#section-4.1.1
+	if s.pkce.Enforce && codeChallenge == "" {
+		return nil, newRedirectedErr(errInvalidRequest, "PKCE is required. The code_challenge parameter must be provided.")
 	}
 
 	var (
@@ -537,7 +515,7 @@ func (s *Server) parseAuthorizationRequest(r *http.Request) (*storage.AuthReques
 				continue
 			}
 
-			isTrusted, err := s.validateCrossClientTrust(clientID, peerID)
+			isTrusted, err := s.validateCrossClientTrust(r.Context(), clientID, peerID)
 			if err != nil {
 				return nil, newRedirectedErr(errServerError, "Internal server error.")
 			}
@@ -630,14 +608,14 @@ func parseCrossClientScope(scope string) (peerID string, ok bool) {
 	return
 }
 
-func (s *Server) validateCrossClientTrust(clientID, peerID string) (trusted bool, err error) {
+func (s *Server) validateCrossClientTrust(ctx context.Context, clientID, peerID string) (trusted bool, err error) {
 	if peerID == clientID {
 		return true, nil
 	}
-	peer, err := s.storage.GetClient(peerID)
+	peer, err := s.storage.GetClient(ctx, peerID)
 	if err != nil {
 		if err != storage.ErrNotFound {
-			s.logger.Errorf("Failed to get client: %v", err)
+			s.logger.ErrorContext(ctx, "failed to get client", "err", err)
 			return false, err
 		}
 		return false, nil
@@ -668,7 +646,8 @@ func validateRedirectURI(client storage.Client, redirectURI string) bool {
 		return true
 	}
 
-	// verify that the host is of form "http://localhost:(port)(path)" or "http://localhost(path)"
+	// verify that the host is of form "http://localhost:(port)(path)", "http://localhost(path)" or numeric form like
+	// "http://127.0.0.1:(port)(path)"
 	u, err := url.Parse(redirectURI)
 	if err != nil {
 		return false
@@ -676,11 +655,20 @@ func validateRedirectURI(client storage.Client, redirectURI string) bool {
 	if u.Scheme != "http" {
 		return false
 	}
-	if u.Host == "localhost" {
+	return isHostLocal(u.Host)
+}
+
+func isHostLocal(host string) bool {
+	if host == "localhost" || net.ParseIP(host).IsLoopback() {
 		return true
 	}
-	host, _, err := net.SplitHostPort(u.Host)
-	return err == nil && host == "localhost"
+
+	host, _, err := net.SplitHostPort(host)
+	if err != nil {
+		return false
+	}
+
+	return host == "localhost" || net.ParseIP(host).IsLoopback()
 }
 
 func validateConnectorID(connectors []storage.Connector, connectorID string) bool {
@@ -692,12 +680,12 @@ func validateConnectorID(connectors []storage.Connector, connectorID string) boo
 	return false
 }
 
-// storageKeySet implements the oidc.KeySet interface backed by Dex storage
-type storageKeySet struct {
-	storage.Storage
+// signerKeySet implements the oidc.KeySet interface backed by the Dex signer
+type signerKeySet struct {
+	signer signer.Signer
 }
 
-func (s *storageKeySet) VerifySignature(_ context.Context, jwt string) (payload []byte, err error) {
+func (s *signerKeySet) VerifySignature(ctx context.Context, jwt string) (payload []byte, err error) {
 	jws, err := jose.ParseSigned(jwt, []jose.SignatureAlgorithm{jose.RS256, jose.RS384, jose.RS512, jose.ES256, jose.ES384, jose.ES512})
 	if err != nil {
 		return nil, err
@@ -709,14 +697,9 @@ func (s *storageKeySet) VerifySignature(_ context.Context, jwt string) (payload 
 		break
 	}
 
-	skeys, err := s.Storage.GetKeys()
+	keys, err := s.signer.ValidationKeys(ctx)
 	if err != nil {
 		return nil, err
-	}
-
-	keys := []*jose.JSONWebKey{skeys.SigningKeyPub}
-	for _, vk := range skeys.VerificationKeys {
-		keys = append(keys, vk.PublicKey)
 	}
 
 	for _, key := range keys {

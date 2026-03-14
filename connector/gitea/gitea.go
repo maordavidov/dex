@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"sync"
@@ -15,7 +16,6 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/dexidp/dex/connector"
-	"github.com/dexidp/dex/pkg/log"
 )
 
 // Config holds configuration options for gitea logins.
@@ -51,7 +51,7 @@ type giteaUser struct {
 }
 
 // Open returns a strategy for logging in through Gitea
-func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error) {
+func (c *Config) Open(id string, logger *slog.Logger) (connector.Connector, error) {
 	if c.BaseURL == "" {
 		c.BaseURL = "https://gitea.com"
 	}
@@ -61,7 +61,7 @@ func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error)
 		orgs:          c.Orgs,
 		clientID:      c.ClientID,
 		clientSecret:  c.ClientSecret,
-		logger:        logger,
+		logger:        logger.With(slog.Group("connector", "type", "gitea", "id", id)),
 		loadAllGroups: c.LoadAllGroups,
 		useLoginAsID:  c.UseLoginAsID,
 	}, nil
@@ -84,7 +84,7 @@ type giteaConnector struct {
 	orgs         []Org
 	clientID     string
 	clientSecret string
-	logger       log.Logger
+	logger       *slog.Logger
 	httpClient   *http.Client
 	// if set to true and no orgs are configured then connector loads all user claims (all orgs and team)
 	loadAllGroups bool
@@ -102,11 +102,11 @@ func (c *giteaConnector) oauth2Config(_ connector.Scopes) *oauth2.Config {
 	}
 }
 
-func (c *giteaConnector) LoginURL(scopes connector.Scopes, callbackURL, state string) (string, error) {
+func (c *giteaConnector) LoginURL(scopes connector.Scopes, callbackURL, state string) (string, []byte, error) {
 	if c.redirectURI != callbackURL {
-		return "", fmt.Errorf("expected callback URL %q did not match the URL in the config %q", c.redirectURI, callbackURL)
+		return "", nil, fmt.Errorf("expected callback URL %q did not match the URL in the config %q", c.redirectURI, callbackURL)
 	}
-	return c.oauth2Config(scopes).AuthCodeURL(state), nil
+	return c.oauth2Config(scopes).AuthCodeURL(state), nil, nil
 }
 
 type oauth2Error struct {
@@ -121,7 +121,7 @@ func (e *oauth2Error) Error() string {
 	return e.error + ": " + e.errorDescription
 }
 
-func (c *giteaConnector) HandleCallback(s connector.Scopes, r *http.Request) (identity connector.Identity, err error) {
+func (c *giteaConnector) HandleCallback(s connector.Scopes, connData []byte, r *http.Request) (identity connector.Identity, err error) {
 	q := r.URL.Query()
 	if errType := q.Get("error"); errType != "" {
 		return identity, &oauth2Error{errType, q.Get("error_description")}
